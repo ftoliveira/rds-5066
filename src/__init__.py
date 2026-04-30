@@ -25,11 +25,9 @@ from src.dpdu_frame import (
 from src.modem.hf_modem_adapter import HFModemAdapter
 from src.modem_if import ModemConfig, ModemInterface
 from src.non_arq import NonArqEngine
-from src.phase3_node import Phase3Node
 from src.arq import ArqEngine
 from src.stanag_node import StanagNode
-from src.sis import SIS, encode_spdu, decode_spdu
-from src.phase4_node import Phase4Node
+from src.sis import encode_spdu, decode_spdu
 from src.stypes import (
     CPDU, CPDUType, CPDUBreakReason, CPDURejectReason, CasLinkState,
     DPDU, DPDUType, NonArqDelivery, PhysicalLinkType,
@@ -52,11 +50,8 @@ __all__ = [
     "NonArqDelivery",
     "NonArqEngine",
     "PhysicalLinkType",
-    "Phase3Node",
     "ArqEngine",
-    "SIS",
     "SPDU",
-    "Phase4Node",
     "StanagNode",
     "DeliveryMode",
     "LinkType",

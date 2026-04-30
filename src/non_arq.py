@@ -5,7 +5,9 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 
-EOW_TYPE_NON_ARQ = 3  # Deprecated: Non-ARQ D_PDUs can carry any EOW type
+# Default EOW type used by Non-ARQ segments when none is specified by the caller.
+# Per Annex C.3.10, Non-ARQ D_PDUs may carry any EOW type.
+EOW_TYPE_NON_ARQ = 3
 
 
 @dataclass

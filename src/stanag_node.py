@@ -1,9 +1,8 @@
-"""StanagNode — Nó unificado STANAG 5066 (Phase 3 DTS + Phase 4 SIS).
+"""StanagNode — Nó unificado STANAG 5066 (DTS + SIS).
 
 Combina multiplexação DTS (CAS + Non-ARQ controle + ARQ dados) com a
-camada SIS (SAPs, filas de prioridade, sessões soft/hard link, TTL/TTD).
-
-Substitui Phase3Node + SIS + Phase4Node numa única classe.
+camada SIS (SAPs, filas de prioridade, sessões soft/hard link, TTL/TTD)
+em uma única classe.
 """
 
 from __future__ import annotations
@@ -480,7 +479,7 @@ class StanagNode:
         self._flow_on = False
 
     # -------------------------------------------------------------------
-    # Métodos de enlace (Phase3Node API)
+    # Métodos de enlace (CAS / Hard Link API)
     # -------------------------------------------------------------------
 
     def make_link(self, remote_node: int, current_time_ms: int | None = None,
@@ -568,7 +567,7 @@ class StanagNode:
         self._manage_soft_link(current_time_ms)
 
     # ===================================================================
-    # DTS internals (ex-Phase3Node)
+    # DTS internals
     # ===================================================================
 
     def _on_non_arq_delivery(self, delivery: NonArqDelivery) -> None:

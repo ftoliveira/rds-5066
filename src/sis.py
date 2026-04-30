@@ -1,7 +1,8 @@
-"""SIS — Subnetwork Interface Sublayer (STANAG 5066 Annex A).
+"""SIS codec — Subnetwork Interface Sublayer (STANAG 5066 Annex A).
 
-Gerencia SAPs (0-15), filas de prioridade, sessões de enlace (soft/hard),
-TTL/TTD e roteamento de U_PDUs. Encapsula Phase3Node internamente.
+Funções de codificação/decodificação de S_PDUs e dataclasses internas usadas
+por StanagNode. A lógica de SAPs, sessões soft/hard link e roteamento de
+U_PDUs vive em src.stanag_node.StanagNode.
 
 Codificação S_PDU conforme Annex A Figuras A-3, A-4.
 """
@@ -344,35 +345,3 @@ class _SisCallbacks:
     hard_link_terminated: Optional[Callable] = None
 
 
-# ---------------------------------------------------------------------------
-# SIS — alias deprecated, use StanagNode
-# ---------------------------------------------------------------------------
-
-
-def __getattr__(name):
-    if name == "SIS":
-        from src.stanag_node import StanagNode
-        return StanagNode
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
-# Ensure `from src.sis import SIS` still works at class level for isinstance checks.
-# The module-level __getattr__ above handles attribute access; for subclass aliasing
-# we define a thin wrapper that is resolved lazily.
-import sys as _sys
-
-class _SISMeta(type):
-    """Metaclass that lazily resolves the base class to StanagNode."""
-    def __instancecheck__(cls, instance):
-        from src.stanag_node import StanagNode
-        return isinstance(instance, StanagNode)
-    def __subclasscheck__(cls, subclass):
-        from src.stanag_node import StanagNode
-        return issubclass(subclass, StanagNode)
-
-
-class SIS(metaclass=_SISMeta):
-    """Deprecated: use StanagNode."""
-    def __new__(cls, *args, **kwargs):
-        from src.stanag_node import StanagNode
-        return StanagNode(*args, **kwargs)

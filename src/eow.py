@@ -36,11 +36,6 @@ class EOWType(IntEnum):
     FREQUENCY_CHANGE_RSP = 6  # Reserved for Annex I
     HDR_CHANGE_REQUEST = 7    # Extended EOW in MGMT D_PDU (Type 7)
 
-    # Backward-compat aliases
-    DATA_RATE_CHANGE = 1
-    FREQUENCY_CHANGE = 5
-    VERSION = 3  # old mapping (was incorrect, type 3 = unrecognized type error)
-
 
 # ---------------------------------------------------------------------------
 # Data Rate Codes (Table C-18 / C-6)

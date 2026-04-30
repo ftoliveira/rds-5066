@@ -1,15 +1,12 @@
 """Core STANAG 5066 data structures.
 
-Tipos usados pelo CAS (CASEngine/Phase3Node) e pelo DTS (ARQ/Non-ARQ).
+Tipos usados pelo CAS (CASEngine), DTS (ARQ/Non-ARQ) e SIS (StanagNode).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import IntEnum, StrEnum
-
-
-# --- Tipos do CAS (CASEngine, Phase3Node) ---
 
 
 # --- Tipos do DTS (D_PDU framing, ARQ, Non-ARQ) ---
