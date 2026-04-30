@@ -263,17 +263,20 @@ class ExpeditedArqEngine:
                     if self.delivery_callback:
                         self.delivery_callback(payload)
 
-            # Enviar ACK para todo segmento recebido com CRC válido
+            # Enviar ACK para todo segmento recebido com CRC válido.
+            # C.6.2 §12 / C.3.4 §3: RX LWE = oldest D_PDU number that has
+            # NOT been received → próximo seq esperado, i.e. (seq+1) mod 256.
             addr = dpdu_set_address(
                 destination=dpdu.address.source,
                 source=self.local_node_address,
             )
             eot = dpdu_calc_eot_field(1)
+            next_expected = (seq + 1) % EXPEDITED_FSN_MOD
             ack_dpdu = build_expedited_ack_only(
-                EOW_EXPEDITED, eot, addr, rx_lwe=seq
+                EOW_EXPEDITED, eot, addr, rx_lwe=next_expected
             )
             self._pending_ack = encode_dpdu(ack_dpdu)
-            self._rx_frame_seq = (seq + 1) % EXPEDITED_FSN_MOD
+            self._rx_frame_seq = next_expected
             return
 
         if dpdu.dpdu_type is DPDUType.EXPEDITED_ACK_ONLY:
@@ -281,7 +284,10 @@ class ExpeditedArqEngine:
                 return
             rx_lwe = dpdu.ack.rx_lwe
             _log_exp(f"RX expedited ACK rx_lwe={rx_lwe}")
-            if self._waiting_ack and rx_lwe == self._tx_frame_seq:
+            # C.6.2 §12 / C.3.4 §3: o ACK conformante envia rx_lwe = próximo
+            # FSN esperado pelo peer; portanto compara contra tx_frame_seq+1.
+            expected_ack = (self._tx_frame_seq + 1) % EXPEDITED_FSN_MOD
+            if self._waiting_ack and rx_lwe == expected_ack:
                 self._waiting_ack = False
                 self._current_encoded = None
                 self._current_dpdu = None

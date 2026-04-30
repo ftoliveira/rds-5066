@@ -81,9 +81,14 @@ _CONNECTED_STATES = frozenset({
 # WARNING reason codes (C.6.1, Tables C-10 to C-25)
 # ---------------------------------------------------------------------------
 
-WARNING_REASON_CONN_DPDU_BUT_UNCONNECTED = 1  # Connection-Related D_PDU but Unconnected
-WARNING_REASON_UNCONNECTED_DPDU_REQUIRES_LINK = 2  # D_PDU requires active link
-WARNING_REASON_INVALID_DPDU_FOR_STATE = 3  # Invalid D_PDU for Current State
+WARNING_REASON_UNRECOGNIZED_TYPE = 0          # Unrecognised D_PDU type Received
+WARNING_REASON_CONN_DPDU_BUT_UNCONNECTED = 1  # Connection-related D_PDU while Unconnected
+WARNING_REASON_INVALID_DPDU = 2               # Invalid D_PDU Received (generic)
+WARNING_REASON_INVALID_DPDU_FOR_STATE = 3     # Invalid D_PDU Received for Current State
+
+# Backward-compat alias (nome antigo era enganoso — apontava para 2 mas a
+# norma define reason 2 como "Invalid D_PDU Received" genérico).
+WARNING_REASON_UNCONNECTED_DPDU_REQUIRES_LINK = WARNING_REASON_INVALID_DPDU
 
 # D_PDU types that are connection-related (require a connection to be valid)
 _CONNECTION_DPDUS = frozenset({
@@ -138,12 +143,13 @@ _ALLOWED: dict[DTSState, frozenset[DPDUType]] = {
         DPDUType.EXPEDITED_DATA_ONLY,
         DPDUType.EXPEDITED_ACK_ONLY,
     },
+    # C.6.1 / Tabela C-20: durante EXPEDITED data exchange, transmissão de
+    # dados regulares (Tipos 0/1/2) deve ser suspensa. Apenas Expedited
+    # (4/5), MGMT (6), Non-ARQ (7/8), WARNING (15) e RESET (3) são válidos.
     DTSState.EXPEDITED_CONNECTED: _ALWAYS_ALLOWED | {
         DPDUType.EXPEDITED_DATA_ONLY,
         DPDUType.EXPEDITED_ACK_ONLY,
-        DPDUType.DATA_ONLY,
-        DPDUType.ACK_ONLY,
-        DPDUType.DATA_ACK,
+        DPDUType.MANAGEMENT,
         DPDUType.RESETWIN_RESYNC,
     },
     DTSState.MANAGEMENT_CONNECTED: _ALWAYS_ALLOWED | {
@@ -173,17 +179,24 @@ class DTSStateMachine:
         """Return True if *dpdu_type* is accepted in the current state."""
         return dpdu_type in _ALLOWED.get(self._state, frozenset())
 
-    def warning_reason(self, dpdu_type: DPDUType) -> Optional[int]:
+    def warning_reason(self, dpdu_type: DPDUType | int) -> Optional[int]:
         """Return the WARNING reason code if *dpdu_type* is invalid, else None.
 
-        Per Tables C-10..C-25:
-        - Reason 1: connection-related D_PDU received while unconnected
-        - Reason 3: invalid D_PDU for current state
+        Tabela C-3:
+          0 — Unrecognised D_PDU type Received (tipo numérico desconhecido)
+          1 — Connection-related D_PDU Received While Not Currently Connected
+          2 — Invalid D_PDU Received (genérico)
+          3 — Invalid D_PDU Received for Current State
         """
-        if self.is_allowed(dpdu_type):
+        # Type não reconhecido (fora do enum DPDUType) → reason 0.
+        try:
+            dpdu_enum = DPDUType(int(dpdu_type))
+        except ValueError:
+            return WARNING_REASON_UNRECOGNIZED_TYPE
+        if self.is_allowed(dpdu_enum):
             return None
-        # Connection-related D_PDU but we are unconnected
-        if not self._state.is_connected and dpdu_type in _CONNECTION_DPDUS:
+        # Connection-related D_PDU mas estamos desconectados → reason 1.
+        if not self._state.is_connected and dpdu_enum in _CONNECTION_DPDUS:
             return WARNING_REASON_CONN_DPDU_BUT_UNCONNECTED
         return WARNING_REASON_INVALID_DPDU_FOR_STATE
 

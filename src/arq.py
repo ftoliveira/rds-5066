@@ -144,10 +144,16 @@ def _segment_cpdu(
     next_seq: int,
     deliver_in_order: bool,
     eot: int = 0,
-    tx_uwe: bool = False,
-    tx_lwe: bool = False,
+    tx_uwe_seq: int | None = None,
+    tx_lwe_seq: int | None = None,
 ) -> list[tuple[DPDU, bytes]]:
-    """Segment C_PDU into DATA_ONLY DPDUs. Returns list of (DPDU, encoded_bytes)."""
+    """Segment C_PDU into DATA_ONLY DPDUs. Returns list of (DPDU, encoded_bytes).
+
+    C.3.3 §11-12: as flags TX_UWE/TX_LWE são setadas exatamente no segmento
+    cujo ``tx_frame_seq`` coincide com o TX_UWE/TX_LWE atual; demais segmentos
+    transportam as flags zeradas. ``tx_uwe_seq``/``tx_lwe_seq`` informam quais
+    são esses seqs (None desliga a flag para o batch).
+    """
     if not payload:
         return []
     segments: list[tuple[DPDU, bytes]] = []
@@ -170,8 +176,8 @@ def _segment_cpdu(
             pdu_start=pdu_start,
             pdu_end=pdu_end,
             deliver_in_order=deliver_in_order,
-            tx_uwe=tx_uwe,
-            tx_lwe=tx_lwe,
+            tx_uwe=(tx_uwe_seq is not None and seq == tx_uwe_seq),
+            tx_lwe=(tx_lwe_seq is not None and seq == tx_lwe_seq),
         )
         encoded = encode_dpdu(dpdu)
         _log_arq(
@@ -451,9 +457,12 @@ class ArqEngine:
 
         if self._tx_state == ArqTxState.SEGMENT:
             payload, deliver_in_order = self._tx_queue[0]
-            # P3: flags dinâmicos tx_lwe/tx_uwe
-            lwe_changed = self._tx_lwe != self._last_reported_lwe
-            window_full = _seq_dist(self._tx_lwe, self._next_seq) >= self.window_size
+            # C.3.3 §11-12: flag TX_LWE setada apenas no D_PDU cujo seq ==
+            # TX_LWE; flag TX_UWE no D_PDU cujo seq == TX_UWE (último alocado).
+            n_segments = (len(payload) + MAX_DATA_BYTES - 1) // MAX_DATA_BYTES
+            new_uwe = (
+                _seq_add(self._next_seq, n_segments - 1) if n_segments > 0 else None
+            )
             self._current_segments = _segment_cpdu(
                 payload,
                 self.local_node_address,
@@ -461,8 +470,8 @@ class ArqEngine:
                 self._next_seq,
                 deliver_in_order,
                 eot=eot,
-                tx_uwe=window_full,
-                tx_lwe=lwe_changed,
+                tx_uwe_seq=new_uwe,
+                tx_lwe_seq=self._tx_lwe,
             )
             self._last_reported_lwe = self._tx_lwe
             for _dpdu, enc in self._current_segments:
@@ -663,14 +672,28 @@ class ArqEngine:
             idx = seq % self.window_size
             if idx >= len(self._rx_window):
                 return
-            if dpdu.data_crc_ok is False:
+            # C.3.4 §7: D_PDUs com DROP_PDU = 1 devem ser ACKed positivamente
+            # mesmo quando o CRC do payload está corrompido — o emissor já
+            # decidiu descartar o segmento, portanto não há razão para o
+            # receptor pedir retransmissão.
+            drop_pdu_flag = bool(dpdu.data and dpdu.data.drop_pdu)
+            if dpdu.data_crc_ok is False and not drop_pdu_flag:
                 _log_arq(f"RX frame seq={seq} CRC ERROR, marcando como erro")
                 self._rx_window[idx].seq = seq
                 self._rx_window[idx].status = RxFrameStatus.ERROR
                 self._ack_dirty = True
                 return
             self._rx_window[idx].seq = seq
-            self._rx_window[idx].data = bytes(dpdu.user_data)
+            # Quando DROP_PDU=1 e o CRC falhou, o payload está suspeito e não
+            # deve ser entregue ao reassembler — armazenamos vazio.
+            if dpdu.data_crc_ok is False and drop_pdu_flag:
+                self._rx_window[idx].data = b""
+                _log_arq(
+                    f"RX frame seq={seq} DROP_PDU=1 c/ CRC erro: ACK positivo,"
+                    f" payload descartado (C.3.4 §7)"
+                )
+            else:
+                self._rx_window[idx].data = bytes(dpdu.user_data)
             self._rx_window[idx].status = RxFrameStatus.RECEIVED
             self._rx_window[idx].pdu_start = dpdu.data.pdu_start
             self._rx_window[idx].pdu_end = dpdu.data.pdu_end

@@ -250,3 +250,121 @@ def build_eow_capability(bitmap: int) -> int:
 def build_eow_version(version: int = 0) -> int:
     """Build a 12-bit EOW for version (uses Type 3 slot — legacy compat)."""
     return ((version & 0xFF) << 4) | EOWType.UNRECOGNIZED_TYPE
+
+
+# ---------------------------------------------------------------------------
+# EOW Type 7 — HDR Change Request (Annex C.5.5, Table C-9-1 / C-9-2 / C-9-4)
+# ---------------------------------------------------------------------------
+
+class HDRWaveform(IntEnum):
+    """Modem waveform codes for the HDR Change Request (Table C-9-2)."""
+
+    MS110A = 0
+    MS110B = 1
+    STANAG_4285 = 2
+    STANAG_4539 = 3
+    STANAG_4529 = 4
+    STANAG_4415 = 5
+    STANAG_4481_FSK = 6
+    USER_CONFIGURATION_OPTION_1 = 7
+    USER_CONFIGURATION_OPTION_2 = 8
+    USER_CONFIGURATION_OPTION_3 = 9
+    # 10..31 unspecified
+
+
+# Tamanho fixo do Extended Message field (Table C-9-4):
+#  bytes 0-3 = Data rate (32 bits, MSB at offset 0)
+#  bytes 4-5 = Interleaver length (16 bits, hundredths of seconds)
+HDR_EXTENDED_MESSAGE_SIZE = 6
+
+
+@dataclass(slots=True, frozen=True)
+class HDRChangeRequestEOW:
+    """Conteúdo decodificado de um EOW Type 7 (Tabela C-9-1)."""
+
+    waveform: int          # 5 bits (HDRWaveform)
+    number_of_channels: int  # 1..8 — em wire: 1..7 + 0 representando 8
+
+
+def build_eow_hdr_change_request(
+    waveform: int,
+    number_of_channels: int,
+) -> int:
+    """Constrói o campo EOW (12 bits) para Type 7 HDR Change Request.
+
+    Layout (Tabela C-9-1):
+      bits 11-8 : TYPE = 7
+      bits 7-3  : MODEM WAVEFORM (5 bits, Tabela C-9-2)
+      bits 2-0  : NUMBER OF CHANNELS (3 bits; 1..7 + 0=8)
+
+    ``number_of_channels`` deve estar em 1..8; o valor 8 é codificado como
+    binário 000 conforme C.5.5 §5.
+    """
+    if not (0 <= waveform <= 0x1F):
+        raise ValueError(f"waveform deve estar em 0-31 (5 bits), got {waveform}")
+    if not (1 <= number_of_channels <= 8):
+        raise ValueError(
+            f"number_of_channels deve estar em 1-8, got {number_of_channels}"
+        )
+    channels_wire = 0 if number_of_channels == 8 else number_of_channels
+    type_field = int(EOWType.HDR_CHANGE_REQUEST) & 0x0F  # 7 = 0b0111
+    return (type_field << 8) | ((waveform & 0x1F) << 3) | (channels_wire & 0x07)
+
+
+def parse_eow_hdr_change_request(eow: int) -> HDRChangeRequestEOW:
+    """Decodifica um EOW Type 7 (12 bits). Levanta ValueError se TYPE != 7."""
+    type_field = (eow >> 8) & 0x0F
+    if type_field != int(EOWType.HDR_CHANGE_REQUEST):
+        raise ValueError(
+            f"EOW não é Type 7 (got TYPE={type_field}, esperado 7)"
+        )
+    waveform = (eow >> 3) & 0x1F
+    channels_wire = eow & 0x07
+    number_of_channels = 8 if channels_wire == 0 else channels_wire
+    return HDRChangeRequestEOW(
+        waveform=waveform, number_of_channels=number_of_channels,
+    )
+
+
+def is_eow_hdr_change_request(eow: int) -> bool:
+    """True se o EOW de 12 bits codifica um Type 7 (HDR Change Request)."""
+    return ((eow >> 8) & 0x0F) == int(EOWType.HDR_CHANGE_REQUEST)
+
+
+@dataclass(slots=True, frozen=True)
+class HDRExtendedMessage:
+    """Campo Extended Message do MGMT D_PDU para HDR (Tabela C-9-4)."""
+
+    data_rate_bps: int              # 32 bits, MSB at offset 0
+    interleaver_centiseconds: int   # 16 bits
+
+
+def build_hdr_extended_message(
+    data_rate_bps: int,
+    interleaver_centiseconds: int,
+) -> bytes:
+    """Constrói os 6 bytes do Extended Message field para HDR (Tabela C-9-4)."""
+    if not (0 <= data_rate_bps <= 0xFFFFFFFF):
+        raise ValueError(
+            f"data_rate_bps deve caber em 32 bits, got {data_rate_bps}"
+        )
+    if not (0 <= interleaver_centiseconds <= 0xFFFF):
+        raise ValueError(
+            "interleaver_centiseconds deve caber em 16 bits, got "
+            f"{interleaver_centiseconds}"
+        )
+    return data_rate_bps.to_bytes(4, "big") + interleaver_centiseconds.to_bytes(2, "big")
+
+
+def parse_hdr_extended_message(payload: bytes) -> HDRExtendedMessage:
+    """Decodifica os 6 bytes do Extended Message do HDR Change Request."""
+    if len(payload) != HDR_EXTENDED_MESSAGE_SIZE:
+        raise ValueError(
+            f"HDR Extended Message deve ter {HDR_EXTENDED_MESSAGE_SIZE} bytes, "
+            f"got {len(payload)}"
+        )
+    data_rate = int.from_bytes(payload[:4], "big")
+    interleaver = int.from_bytes(payload[4:6], "big")
+    return HDRExtendedMessage(
+        data_rate_bps=data_rate, interleaver_centiseconds=interleaver,
+    )

@@ -43,6 +43,11 @@ def decode_s_primitive(stream: bytes) -> tuple[int, bytes, int]:
         raise ValueError("Incomplete header")
 
     version = stream[idx + 2]
+    if version != VERSION:
+        raise ValueError(
+            f"Unsupported S_Primitive version 0x{version:02X} "
+            f"(expected 0x{VERSION:02X}, A.2.2)"
+        )
     size = struct.unpack_from('<H', stream, idx + 3)[0]
 
     if size < 1:

@@ -1,12 +1,18 @@
 """
-FAB (Frequency Availability Broadcast) — SAP 15 (unassigned, configurable).
+FAB (Frequency Availability Broadcast) — extensão **não-normativa**.
 
-FAB Generator (lado shore) — broadcast non-ARQ periódico.
-FAB Receiver (lado ship) — escuta FAI broadcasts.
+⚠️ Aviso: este módulo NÃO faz parte da norma STANAG 5066 Edição 3 e foi
+mantido em ``src/annex_f/`` apenas por conveniência. Para evitar conflito
+com clientes normativos, o FAB usa SAP 15 (faixa "UNASSIGNED – arbitrary
+use", Tabela F-1). O SAP é configurável via ``sap_id`` no construtor.
 
-Nota: FAB não é definido na norma STANAG 5066. Usa SAP 15 (unassigned)
-por padrão para evitar conflito com UDOP (SAP 7). O SAP é configurável
-via parâmetro sap_id no construtor.
+Componentes:
+  FABGenerator — broadcast non-ARQ periódico (lado shore).
+  FABReceiver  — escuta FAI broadcasts (lado ship).
+
+Implementações conformantes podem ignorar este módulo. Caso seja necessário
+maior isolamento, mover para um package ``src/extras/`` é recomendado em
+revisões futuras.
 """
 
 from __future__ import annotations

@@ -132,6 +132,13 @@ def _encode_type_specific_header(dpdu: DPDU) -> bytes:
         if dpdu.data is None:
             raise ValueError("Data DPDU requires data header fields")
         if dpdu.dpdu_type is DPDUType.EXPEDITED_DATA_ONLY:
+            # C.3.7 §7: C_PDU ID NUMBER é 4 bits (modulo 16). Os 4 high bits
+            # do byte 3 são NOT_USED e devem ser zerados na transmissão.
+            if not (0 <= dpdu.data.cpdu_id <= 0x0F):
+                raise ValueError(
+                    "EXPEDITED_DATA_ONLY cpdu_id deve ser 0-15 "
+                    f"(C.3.7 §7), got {dpdu.data.cpdu_id}"
+                )
             flags = (
                 ((1 if dpdu.data.pdu_start else 0) << 7)
                 | ((1 if dpdu.data.pdu_end else 0) << 6)
@@ -141,7 +148,7 @@ def _encode_type_specific_header(dpdu: DPDU) -> bytes:
                 flags,
                 dpdu.data.data_size & 0xFF,
                 dpdu.data.tx_frame_seq & 0xFF,
-                dpdu.data.cpdu_id & 0xFF,
+                dpdu.data.cpdu_id & 0x0F,
             ])
 
         flags = (
@@ -262,7 +269,8 @@ def _parse_type_specific_header(
                 pdu_end=bool(flags & 0x40),
                 data_size=((flags & 0x03) << 8) | header_bytes[1],
                 tx_frame_seq=header_bytes[2],
-                cpdu_id=header_bytes[3],
+                # C.3.7 §7: cpdu_id é 4 bits; high nibble do byte 3 é NOT_USED.
+                cpdu_id=header_bytes[3] & 0x0F,
             )
             return data, None, None, None, None, None, data.data_size
 

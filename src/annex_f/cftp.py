@@ -152,7 +152,20 @@ def _decode_cftp_message(raw: bytes) -> CftpMessage:
         message_size = int(lines[2].decode("ascii").strip())
     except ValueError as exc:
         raise ValueError(f"CFTP: MessageSize inválido: {exc}") from exc
-    message = lines[3][:message_size]
+    body = lines[3]
+    if len(body) > message_size:
+        logger.warning(
+            "CFTP: MessageSize=%d mas body tem %d bytes; descartando %d bytes "
+            "extras (possivelmente padding da compressão).",
+            message_size, len(body), len(body) - message_size,
+        )
+    elif len(body) < message_size:
+        logger.warning(
+            "CFTP: MessageSize=%d declarado mas body tem apenas %d bytes "
+            "(mensagem truncada).",
+            message_size, len(body),
+        )
+    message = body[:message_size]
     return CftpMessage(message_id, recipients, message)
 
 

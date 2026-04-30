@@ -19,6 +19,7 @@ Suporta múltiplos Physical Links simultâneos conforme B.3 item 2:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Callable
 
 from .flow_log import flow_rx, flow_tx
 from .non_arq import NonArqEngine
@@ -66,8 +67,15 @@ def encode_cpdu(cpdu: CPDU) -> bytes:
     raise ValueError(f"CPDU type {t} not in Annex B")
 
 
-def decode_cpdu(data: bytes) -> CPDU:
-    """Decodifica C_PDU conforme Annex B Edition 3. Byte 0: [TYPE(4)][FIELD(4)]."""
+def decode_cpdu(data: bytes, *, strict: bool = False) -> CPDU:
+    """Decodifica C_PDU conforme Annex B Edition 3. Byte 0: [TYPE(4)][FIELD(4)].
+
+    ``strict``: quando True, valida que os bits ``NOT_USED`` em LINK_REQUEST
+    (bits 1-3 do low nibble — B.3.1.2 §4) e em LINK_ACCEPTED/LINK_BREAK_CONFIRM
+    (low nibble inteiro — B.3 §8) estão zerados; caso contrário levanta
+    ``ValueError``. Por padrão (modo permissivo) os bits são silenciosamente
+    descartados, conforme princípio robust-be-permissive.
+    """
     if len(data) < 1:
         raise ValueError("CPDU buffer too short")
     b0 = data[0]
@@ -76,12 +84,27 @@ def decode_cpdu(data: bytes) -> CPDU:
     if t == 0:
         return CPDU(cpdu_type=CPDUType.DATA, payload=data[1:])
     if t == 1:
+        if strict and (low & 0x0E) != 0:
+            raise ValueError(
+                "LINK_REQUEST: bits 1-3 do field são NOT_USED (B.3.1.2 §4) "
+                f"mas vieram = 0x{low:01X}"
+            )
         return CPDU(cpdu_type=CPDUType.LINK_REQUEST, link_type=low & 0x01)
     if t == 2:
+        if strict and low != 0:
+            raise ValueError(
+                "LINK_ACCEPTED: low nibble deve ser 0 (B.3 §8), "
+                f"got 0x{low:01X}"
+            )
         return CPDU(cpdu_type=CPDUType.LINK_ACCEPTED)
     if t in (3, 4):
         return CPDU(cpdu_type=CPDUType(t), reason=low)
     if t == 5:
+        if strict and low != 0:
+            raise ValueError(
+                "LINK_BREAK_CONFIRM: low nibble deve ser 0 (B.3 §8), "
+                f"got 0x{low:01X}"
+            )
         return CPDU(cpdu_type=CPDUType.LINK_BREAK_CONFIRM)
     raise ValueError(f"Invalid CPDU type {t}")
 
@@ -127,6 +150,7 @@ class CASEngine:
         called_idle_timeout_ms: int = 30_000,
         allow_incoming_links: bool = True,
         busy: bool = False,
+        arq_data_handler: Callable[[int, bytes], None] | None = None,
     ) -> None:
         self.local_node_address = local_node_address
         self.non_arq = non_arq
@@ -137,6 +161,11 @@ class CASEngine:
         self.called_idle_timeout_ms = called_idle_timeout_ms
         self.allow_incoming_links = allow_incoming_links
         self.busy = busy
+        # B.3.1 §5-7: o serviço de entrega do DATA C_PDU deve seguir o modo
+        # solicitado pelo SIS (ARQ ou Non-ARQ). Quando ``use_arq=True`` em
+        # ``send_data``, o ``arq_data_handler(dest_addr, encoded_cpdu)`` é
+        # chamado para que o orquestrador despache via ARQ.
+        self.arq_data_handler = arq_data_handler
 
         self.event_log: list[CasEvent] = []
         self.received_data_cpdus: list[CPDU] = []
@@ -245,11 +274,28 @@ class CASEngine:
 
     def make_link(self, remote_node_address: int, current_time_ms: int,
                   link_type: PhysicalLinkType = PhysicalLinkType.NONEXCLUSIVE) -> None:
-        """Inicia protocolo de estabelecimento de link (Caller)."""
+        """Inicia protocolo de estabelecimento de link (Caller).
+
+        B.3.2 (4) caller-side: rejeita iniciar Nonexclusive enquanto há um
+        Exclusive ativo ou pendente — caso contrário o nó pode emitir
+        LINK_REQUESTs incoerentes com sua própria política. Para iniciar um
+        Nonexclusive nesse cenário, o caller deve primeiro fazer break_link
+        no Exclusive existente.
+        """
         # Verificar se já existe um outgoing call pendente (CALLING/BREAKING)
         pctx = self._primary_ctx
         if pctx and pctx.state in (CasLinkState.CALLING, CasLinkState.BREAKING):
             raise RuntimeError("CAS link is already active or pending")
+        # B.3.2 (4): Nonexclusive não pode coexistir com Exclusive (ativo ou
+        # pendente). Bloqueia o caller antes de emitir o LINK_REQUEST.
+        if link_type == PhysicalLinkType.NONEXCLUSIVE:
+            for c in self._links.values():
+                if (c.link_type == PhysicalLinkType.EXCLUSIVE
+                        and c.state in (CasLinkState.CALLING, CasLinkState.MADE)):
+                    raise RuntimeError(
+                        "Cannot start Nonexclusive link while Exclusive link is "
+                        "active or pending (B.3.2 (4))"
+                    )
         # Limpar link primário antigo se em IDLE/FAILED (não remover links MADE)
         if pctx and pctx.state in (CasLinkState.IDLE, CasLinkState.FAILED):
             self._remove_link(self._primary_remote)  # type: ignore
@@ -283,18 +329,40 @@ class CASEngine:
         self._emit_event(CasEvent(state=CasLinkState.BREAKING, remote=target))
         self._send_control_cpdu(CPDU(CPDUType.LINK_BREAK, reason=reason), target)
 
-    def send_data(self, payload: bytes, *, expedited: bool = False) -> None:
-        """Envia DATA C_PDU no link primário."""
+    def send_data(
+        self,
+        payload: bytes,
+        *,
+        expedited: bool = False,
+        use_arq: bool = False,
+    ) -> None:
+        """Envia DATA C_PDU no link primário (B.3.1 §5-7).
+
+        Quando ``use_arq=True`` o C_PDU é despachado via ``arq_data_handler``
+        registrado pelo orquestrador (tipicamente ``StanagNode.send_data``);
+        ``expedited`` é ignorado nesse caso (Expedited é decidido pelo handler
+        ARQ ao optar por D_PDU Tipo 4 vs 0). Sem ``use_arq`` mantém-se o
+        comportamento Non-ARQ legado.
+        """
         if self._primary_remote is None:
             raise RuntimeError("CAS link is not established")
         ctx = self._primary_ctx
         if ctx is None or ctx.state != CasLinkState.MADE:
             raise RuntimeError("CAS link is not established")
         cpdu = CPDU(CPDUType.DATA, payload=payload)
+        encoded = encode_cpdu(cpdu)
+        if use_arq:
+            if self.arq_data_handler is None:
+                raise RuntimeError(
+                    "send_data(use_arq=True) requer arq_data_handler "
+                    "registrado no construtor (B.3.1 §5-7)"
+                )
+            self.arq_data_handler(self._primary_remote, encoded)
+            return
         self.non_arq.queue_cpdu(
             DPDUType.EXPEDITED_NON_ARQ if expedited else DPDUType.NON_ARQ,
             self._primary_remote,
-            encode_cpdu(cpdu),
+            encoded,
         )
 
     def process_delivery(self, delivery: NonArqDelivery, current_time_ms: int) -> None:
@@ -361,11 +429,16 @@ class CASEngine:
 
         if cpdu.cpdu_type is CPDUType.LINK_BREAK:
             ctx = self._links.get(from_node_address)
-            # Sempre responde com BREAK_CONFIRM (B.3.1.5 shall(5))
+            # Sempre responde com BREAK_CONFIRM (B.3.1.5 shall(5)).
             self._send_control_cpdu(CPDU(CPDUType.LINK_BREAK_CONFIRM), from_node_address)
+            # Só emite o evento de transição IDLE quando havia um link
+            # localmente conhecido — caso contrário poluiria o event_log com
+            # transições para nós nunca conectados.
             if ctx:
                 self._remove_link(from_node_address)
-            self._emit_event(CasEvent(state=CasLinkState.IDLE, remote=from_node_address, cpdu=cpdu))
+                self._emit_event(
+                    CasEvent(state=CasLinkState.IDLE, remote=from_node_address, cpdu=cpdu)
+                )
             return
 
         if cpdu.cpdu_type is CPDUType.LINK_BREAK_CONFIRM:
@@ -413,6 +486,14 @@ class CASEngine:
                 # Spec: abort if no DATA on newly made link
                 baseline = ctx.last_data_rx_ms if ctx.last_data_rx_ms > 0 else ctx.link_made_ms
                 if baseline > 0 and current_time_ms - baseline > self.called_idle_timeout_ms:
+                    # Notifica o peer com LINK_BREAK reason=NO_MORE_DATA antes
+                    # de remover localmente, evitando que ele mantenha um
+                    # link fantasma até seu próprio timeout (BAIXA-B3).
+                    self._send_control_cpdu(
+                        CPDU(CPDUType.LINK_BREAK,
+                             reason=int(CPDUBreakReason.NO_MORE_DATA)),
+                        addr,
+                    )
                     self._remove_link(addr)
                     self._emit_event(CasEvent(state=CasLinkState.IDLE, remote=addr))
 

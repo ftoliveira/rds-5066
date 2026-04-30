@@ -558,8 +558,8 @@ class TestExpeditedArqSegmentation:
         assert d1.data.tx_frame_seq == 0
         assert len(d1.user_data) == 1023
 
-        # ACK primeiro segmento
-        eng.process_rx_dpdu(self._make_ack(0, dest=1, src=2))
+        # ACK primeiro segmento (C.6.2 §12: rx_lwe = next expected = seq+1)
+        eng.process_rx_dpdu(self._make_ack(1, dest=1, src=2))
 
         # Segundo segmento
         frames = eng.process_tx(1)
@@ -587,8 +587,8 @@ class TestExpeditedArqSegmentation:
         assert d1.data.cpdu_id == 0
         assert len(d1.user_data) == 1023
 
-        # ACK segmento 1
-        eng.process_rx_dpdu(self._make_ack(0, dest=1, src=2))
+        # ACK segmento 1 (rx_lwe = seq+1 = 1)
+        eng.process_rx_dpdu(self._make_ack(1, dest=1, src=2))
 
         # Segmento 2: pdu_start=False, pdu_end=False
         frames = eng.process_tx(1)
@@ -599,8 +599,8 @@ class TestExpeditedArqSegmentation:
         assert d2.data.tx_frame_seq == 1
         assert d2.data.cpdu_id == 0
 
-        # ACK segmento 2
-        eng.process_rx_dpdu(self._make_ack(1, dest=1, src=2))
+        # ACK segmento 2 (rx_lwe = 2)
+        eng.process_rx_dpdu(self._make_ack(2, dest=1, src=2))
 
         # Segmento 3: pdu_start=False, pdu_end=True
         frames = eng.process_tx(2)
@@ -612,8 +612,8 @@ class TestExpeditedArqSegmentation:
         assert d3.data.cpdu_id == 0
         assert len(d3.user_data) == 2500 - 1023 - 1023
 
-        # ACK segmento 3
-        eng.process_rx_dpdu(self._make_ack(2, dest=1, src=2))
+        # ACK segmento 3 (rx_lwe = 3)
+        eng.process_rx_dpdu(self._make_ack(3, dest=1, src=2))
 
         # cpdu_id deve ter avançado para 1
         assert eng._cpdu_id == 1
@@ -630,13 +630,13 @@ class TestExpeditedArqSegmentation:
         eng.process_tx(0)
         assert eng._cpdu_id == 0
 
-        # ACK primeiro segmento
-        eng.process_rx_dpdu(self._make_ack(0, dest=1, src=2))
+        # ACK primeiro segmento (rx_lwe = 1)
+        eng.process_rx_dpdu(self._make_ack(1, dest=1, src=2))
         assert eng._cpdu_id == 0  # Ainda 0 — falta o segundo segmento
 
         # Segundo segmento
         eng.process_tx(1)
-        eng.process_rx_dpdu(self._make_ack(1, dest=1, src=2))
+        eng.process_rx_dpdu(self._make_ack(2, dest=1, src=2))  # rx_lwe = 2
         assert eng._cpdu_id == 1  # Agora avançou
 
     def test_rx_reassembly_multi_segment(self):
@@ -701,8 +701,8 @@ class TestExpeditedArqSegmentation:
         assert len(frames2) == 1
         assert frames2[0] == original_frame  # Mesmo frame
 
-        # ACK → próximo segmento
-        eng.process_rx_dpdu(self._make_ack(0, dest=1, src=2))
+        # ACK → próximo segmento (rx_lwe = 1 = next expected)
+        eng.process_rx_dpdu(self._make_ack(1, dest=1, src=2))
         frames3 = eng.process_tx(300)
         assert len(frames3) == 1
         d = decode_dpdu(frames3[0])

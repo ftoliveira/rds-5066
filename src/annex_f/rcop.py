@@ -77,12 +77,23 @@ def encode_rcop_pdu(pdu: RcopPDU) -> bytes:
 
 
 def decode_rcop_pdu(raw: bytes) -> RcopPDU:
-    """Decodifica bytes em RcopPDU. Levanta ValueError se truncado."""
+    """Decodifica bytes em RcopPDU. Levanta ValueError se truncado.
+
+    F.8.1: bits RESERVED do byte 0 (low nibble) **shall** ser 0. O decoder
+    aceita por compatibilidade ("be liberal in what you accept") mas registra
+    warning quando algum bit RESERVED chega ≠ 0.
+    """
     if len(raw) < RCOP_HEADER_SIZE:
         raise ValueError(
             f"RCOP PDU truncado: {len(raw)} bytes (mínimo {RCOP_HEADER_SIZE})"
         )
     byte0, updu_id, segment_number, app_id = struct.unpack_from(">BBHH", raw)
+    reserved = byte0 & 0x0F
+    if reserved != 0:
+        logger.warning(
+            "RCOP PDU: bits RESERVED do byte 0 ≠ 0 (got 0x%X) — F.8.1 exige 0.",
+            reserved,
+        )
     connection_id = (byte0 >> 4) & 0x0F
     app_data = raw[RCOP_HEADER_SIZE:]
     return RcopPDU(connection_id, updu_id, segment_number, app_id, app_data)
@@ -92,27 +103,44 @@ def decode_rcop_pdu(raw: bytes) -> RcopPDU:
 AppHandler = Callable[[int, int, int, bytes], None]
 
 
+import time as _time
+
+
 class _RcopReassemblyContext:
     """Acumula segmentos RCOP/UDOP por (src_addr, src_sap, conn_id, updu_id).
 
     Detecta completude quando len(app_data) < RCOP_MAX_APP_DATA (último segmento).
     Verificação de completude: todos os segmentos 0..max_seg devem estar presentes.
     Conforme F.8.3, o identificador único é (src_addr, src_sap, conn_id, updu_id).
+
+    Ordem F.8.3 não define "última fração": uma mensagem cujo tamanho é
+    múltiplo exato de ``RCOP_MAX_APP_DATA`` nunca é detectada como completa.
+    Para evitar memory leak quando segmentos se perdem, mantemos um timestamp
+    por chave e expiramos contextos antigos via ``purge_expired``.
     """
 
-    def __init__(self):
+    DEFAULT_TIMEOUT_SECONDS: float = 300.0
+
+    def __init__(self, timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS):
         # {(src_addr, src_sap, conn_id, updu_id): {seg_num: (app_id, app_data)}}
         self._buffers: dict[tuple, dict[int, tuple[int, bytes]]] = {}
+        # {key: timestamp_segundos} — última atualização da chave.
+        self._last_seen: dict[tuple, float] = {}
+        self.timeout_seconds = float(timeout_seconds)
 
     def feed(
-        self, src_addr: int, src_sap: int, pdu: RcopPDU
+        self, src_addr: int, src_sap: int, pdu: RcopPDU,
+        *, now: float | None = None,
     ) -> tuple[int, bytes] | None:
         """Alimenta um segmento. Retorna (app_id, dados_completos) ou None."""
         key = (src_addr, src_sap, pdu.connection_id, pdu.updu_id)
+        ts = now if now is not None else _time.monotonic()
+        self._last_seen[key] = ts
 
         # Segmento único (não segmentado): seg_num=0 e dados menores que MTU
         if pdu.segment_number == 0 and len(pdu.app_data) < RCOP_MAX_APP_DATA:
             self._buffers.pop(key, None)
+            self._last_seen.pop(key, None)
             return (pdu.app_id, pdu.app_data)
 
         buf = self._buffers.setdefault(key, {})
@@ -130,10 +158,25 @@ class _RcopReassemblyContext:
         first_app_id = buf[0][0]
         reassembled = b"".join(buf[i][1] for i in range(max_seg + 1))
         del self._buffers[key]
+        self._last_seen.pop(key, None)
         return (first_app_id, reassembled)
+
+    def purge_expired(self, now: float | None = None) -> list[tuple]:
+        """Remove contextos cuja última atualização excedeu ``timeout_seconds``.
+
+        Retorna a lista de chaves descartadas para que o caller possa logar.
+        """
+        ts = now if now is not None else _time.monotonic()
+        deadline = ts - self.timeout_seconds
+        expired = [k for k, t in self._last_seen.items() if t < deadline]
+        for k in expired:
+            self._buffers.pop(k, None)
+            self._last_seen.pop(k, None)
+        return expired
 
     def clear(self):
         self._buffers.clear()
+        self._last_seen.clear()
 
 
 class RcopClient(SubnetClient):
@@ -152,12 +195,27 @@ class RcopClient(SubnetClient):
 
     SAP_ID = SAP_ID_RCOP  # 6
 
-    def __init__(self, node, connection_id: int = 0):
+    def __init__(self, node, connection_id: int = 0,
+                 reassembly_timeout_seconds: float = _RcopReassemblyContext.DEFAULT_TIMEOUT_SECONDS):
         super().__init__(node, connection_id)
         self._rcop_updu_id: int = 0
-        self._rcop_reassembly = _RcopReassemblyContext()
+        self._rcop_reassembly = _RcopReassemblyContext(reassembly_timeout_seconds)
         self._handlers: dict[int, AppHandler] = {}
         self.on_received: AppHandler | None = None  # catch-all
+
+    def purge_stale_reassemblies(self, now: float | None = None) -> list[tuple]:
+        """Descarta contextos de remontagem expirados (ver F.8.3 / MÉDIA-F4).
+
+        Deve ser chamado periodicamente pelo orquestrador; retorna chaves
+        ``(src_addr, src_sap, conn_id, updu_id)`` descartadas.
+        """
+        expired = self._rcop_reassembly.purge_expired(now=now)
+        if expired:
+            logger.warning(
+                "RCOP SAP=%d: descartando %d contexto(s) de remontagem expirado(s)",
+                self.SAP_ID, len(expired),
+            )
+        return expired
 
     # ── Envio ─────────────────────────────────────────────────────────────────
 
@@ -191,11 +249,23 @@ class RcopClient(SubnetClient):
         conn_id: int | None = None,
         priority: int = 5,
         ttl_seconds: float = 120.0,
+        updu_id: int | None = None,
     ) -> int:
-        """Envia dados via RCOP (ARQ). Retorna updu_id alocado."""
+        """Envia dados via RCOP (ARQ). Retorna o updu_id usado.
+
+        Se ``updu_id`` for fornecido explicitamente (necessário em FRAP/FRAPv2
+        para coincidir com o U_PDU do arquivo reconhecido — F.10.2.3 §1), o
+        contador interno não é avançado e o valor passa direto.
+        """
         if conn_id is None:
             conn_id = self.connection_id
-        updu_id = self._alloc_rcop_id()
+        if updu_id is None:
+            updu_id = self._alloc_rcop_id()
+        else:
+            if not (0 <= updu_id <= 0xFF):
+                raise ValueError(
+                    f"updu_id deve ser 0-255, got {updu_id}"
+                )
         segments = self._build_segments(conn_id, updu_id, app_id, data)
 
         for seg_bytes in segments:

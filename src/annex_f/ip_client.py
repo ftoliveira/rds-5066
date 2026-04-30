@@ -58,6 +58,24 @@ class IPClient(SubnetClient):
         self.qos_mode = qos_mode
         self.on_ip_received: callable | None = None
 
+    # IPv4 mínimo (RFC 791): header 20 bytes + ao menos 8 bytes de payload
+    # alinhado a múltiplo de 8. Abaixo desse valor, _fragment_ipv4 entra em
+    # loop infinito (max_payload == 0).
+    _MIN_MTU = 28
+
+    @property
+    def mtu(self) -> int:
+        return self._mtu
+
+    @mtu.setter
+    def mtu(self, value: int) -> None:
+        if value < self._MIN_MTU:
+            raise ValueError(
+                f"IP MTU deve ser >= {self._MIN_MTU} bytes (header IPv4=20 + 8 "
+                f"de payload), got {value}"
+            )
+        self._mtu = int(value)
+
     def send_ip_datagram(self, datagram: bytes) -> bool:
         """Encapsula e envia datagrama IP via SIS.
 
@@ -264,11 +282,3 @@ class IPClient(SubnetClient):
         stanag_addr = self._address_table.pop(ip_addr, None)
         if stanag_addr is not None:
             self._reverse_table.pop(stanag_addr, None)
-
-    @property
-    def mtu(self) -> int:
-        return self._mtu
-
-    @mtu.setter
-    def mtu(self, value: int):
-        self._mtu = value

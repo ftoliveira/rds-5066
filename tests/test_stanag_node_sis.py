@@ -222,7 +222,8 @@ class TestHardLinkTerminateTimeout:
 
 class TestManagementMsgRank:
     def test_rank_15_accepted(self):
-        node = _make_node()
+        # A.2.1.1 §6: rank=15 requer autorização explícita do nó.
+        node = _make_node(allow_management_rank=True)
         node.bind(5, rank=15)
         assert node.validate_management_msg_rank(5) is True
 

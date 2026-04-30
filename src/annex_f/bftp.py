@@ -153,12 +153,12 @@ class FrapClient(RcopClient):
         priority: int = 5,
         ttl_seconds: float = 60.0,
     ):
-        """Envia FRAP ACK para arquivo recebido com (conn_id, updu_id)."""
-        # Força conn_id e updu_id específicos para coincidir com o arquivo
-        old_conn = self.connection_id
-        old_uid = self._rcop_updu_id
-        self.connection_id = conn_id
-        self._rcop_updu_id = updu_id
+        """Envia FRAP ACK para arquivo recebido com (conn_id, updu_id).
+
+        F.10.2.3 §1: o ``updu_id`` no FRAP PDU deve ser idêntico ao do U_PDU
+        que está sendo reconhecido. Passa o ``updu_id`` explicitamente para
+        que ``RcopClient.send`` não avance o contador interno.
+        """
         self.send(
             dest_addr=dest_addr,
             app_id=APP_ID_FRAP,
@@ -166,10 +166,8 @@ class FrapClient(RcopClient):
             conn_id=conn_id,
             priority=priority,
             ttl_seconds=ttl_seconds,
+            updu_id=updu_id,
         )
-        # Restaura estado
-        self.connection_id = old_conn
-        self._rcop_updu_id = old_uid
         logger.debug(
             "FRAP ACK → addr=%d conn_id=%d updu_id=%d",
             dest_addr, conn_id, updu_id,
@@ -210,12 +208,12 @@ class FrapV2Client(RcopClient):
         priority: int = 5,
         ttl_seconds: float = 60.0,
     ):
-        """Envia FRAPv2 ACK com BFTP Header do arquivo reconhecido."""
+        """Envia FRAPv2 ACK com BFTP Header do arquivo reconhecido.
+
+        F.10.2.4 §1: ``updu_id`` no FRAPv2 PDU deve coincidir com o U_PDU
+        reconhecido. Usa o parâmetro explícito de ``RcopClient.send``.
+        """
         body = _build_bftp_header(filename, file_size)
-        old_conn = self.connection_id
-        old_uid = self._rcop_updu_id
-        self.connection_id = conn_id
-        self._rcop_updu_id = updu_id
         self.send(
             dest_addr=dest_addr,
             app_id=APP_ID_FRAPV2,
@@ -223,9 +221,8 @@ class FrapV2Client(RcopClient):
             conn_id=conn_id,
             priority=priority,
             ttl_seconds=ttl_seconds,
+            updu_id=updu_id,
         )
-        self.connection_id = old_conn
-        self._rcop_updu_id = old_uid
         fn = filename if isinstance(filename, str) else filename.decode("ascii", errors="replace")
         logger.debug("FRAPv2 ACK → addr=%d arquivo=%r", dest_addr, fn)
 

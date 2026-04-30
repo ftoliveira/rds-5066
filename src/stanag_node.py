@@ -33,9 +33,12 @@ from src.sis import (
     decode_spdu_data_delivery_fail,
     decode_spdu_hard_link_rejected,
     decode_spdu_hard_link_request,
+    decode_spdu_hard_link_terminate,
     encode_spdu,
     encode_spdu_data_delivery_confirm,
+    encode_spdu_data_delivery_confirm_from,
     encode_spdu_data_delivery_fail,
+    encode_spdu_data_delivery_fail_from,
     encode_spdu_hard_link_confirm,
     encode_spdu_hard_link_rejected,
     encode_spdu_hard_link_request,
@@ -59,6 +62,7 @@ from src.stypes import (
     SisHardLinkTerminateReason,
     SisLinkSessionState,
     SisRejectReason,
+    SisUnbindIndicationReason,
     SisUnidataIndication,
     SPDU,
     SPDU_TYPE_DATA,
@@ -146,6 +150,7 @@ class StanagNode:
         hard_link_establish_timeout_ms: int = 60_000,
         hard_link_terminate_timeout_ms: int = 30_000,
         max_expedited_per_client: int = 0,
+        allow_management_rank: bool = False,
     ) -> None:
         self.local_node_address = local_node_address
         self.modem = modem
@@ -183,6 +188,7 @@ class StanagNode:
             max_retries=cfg.max_retries,
             max_nonexclusive_links=cfg.max_nonexclusive_links,
             called_idle_timeout_ms=int(cfg.called_idle_timeout_seconds * 1000),
+            arq_data_handler=self._cas_arq_data_handler,
         )
 
         # --- ARQ engine ---
@@ -225,8 +231,49 @@ class StanagNode:
         self._max_expedited_per_client = max_expedited_per_client
         self._expedited_counts: dict[int, int] = {}  # sap_id -> count
 
+        # A.2.1.1 §6: rank 15 (gerência) só pode ser concedido a clientes
+        # autorizados. O nó decide a política via flag de construção.
+        self._allow_management_rank: bool = allow_management_rank
+
+        # Rank inferido para clientes remotos (A.3.2.2.1 §1). O S_PDU tipo 3
+        # não carrega o campo Rank, portanto cada nó mantém uma tabela local
+        # mapeando (remote_node_addr, remote_sap) -> rank conhecido. Se a
+        # entrada não existir, usa-se ``_default_remote_rank``.
+        self._remote_rank_table: dict[tuple[int, int], int] = {}
+        self._default_remote_rank: int = 0
+
+        # Último reason recebido em S_PDU TERMINATE (Annex A A.3.1.7); pode ser
+        # consultado por testes/observadores. Não é exposto via callback para
+        # preservar compatibilidade da API.
+        self._last_terminate_reason: int = 0
+
         # Start modem RX
         modem.modem_rx_start()
+
+    # -------------------------------------------------------------------
+    # SIS: Configuração de Rank (A.2.1.1 / A.3.2.2.1)
+    # -------------------------------------------------------------------
+
+    def set_remote_rank(self, remote_addr: int, remote_sap: int, rank: int) -> None:
+        """Declara o rank conhecido de um cliente remoto.
+
+        Usado pelas regras de precedência de Hard Link (A.3.2.2.1 §1) já que o
+        S_PDU tipo 3 não carrega o campo Rank na rede.
+        """
+        if not (0 <= rank <= 15):
+            raise ValueError(f"rank deve estar em 0-15, got {rank}")
+        self._remote_rank_table[(remote_addr, remote_sap)] = rank
+
+    def set_default_remote_rank(self, rank: int) -> None:
+        """Define o rank assumido para clientes remotos sem entrada na tabela."""
+        if not (0 <= rank <= 15):
+            raise ValueError(f"rank deve estar em 0-15, got {rank}")
+        self._default_remote_rank = rank
+
+    def _resolve_remote_rank(self, remote_addr: int, remote_sap: int) -> int:
+        return self._remote_rank_table.get(
+            (remote_addr, remote_sap), self._default_remote_rank
+        )
 
     # -------------------------------------------------------------------
     # Propriedades públicas (acesso direto)
@@ -253,12 +300,44 @@ class StanagNode:
     # -------------------------------------------------------------------
 
     def bind(self, sap_id: int, rank: int = 0, service: ServiceType | None = None) -> int:
-        """Vincula um SAP (0-15). Retorna sap_id. MTU=2048 (Annex A)."""
+        """Vincula um SAP (0-15). Retorna sap_id. MTU=2048 (Annex A).
+
+        A.2.1.1 §5-6: ``rank`` deve estar em 0-15 (4 bits). O valor 15 é
+        reservado a clientes de gerência e só é aceito quando o nó foi
+        construído com ``allow_management_rank=True``; caso contrário a
+        primitiva é rejeitada com ``NOT_ENOUGH_RESOURCES`` (sem privilégio).
+        """
         if not (0 <= sap_id < self.MAX_SAPS):
             if self._callbacks.bind_rejected is not None:
                 self._callbacks.bind_rejected(SisBindRejectReason.INVALID_SAP_ID)
             else:
                 raise ValueError(f"SAP id deve ser 0-{self.MAX_SAPS - 1}, got {sap_id}")
+            return -1
+        if not (0 <= rank <= 15):
+            if self._callbacks.bind_rejected is not None:
+                self._callbacks.bind_rejected(SisBindRejectReason.NOT_ENOUGH_RESOURCES)
+            else:
+                raise ValueError(
+                    f"rank deve estar em 0-15 (A.2.1.1 §5), got {rank}"
+                )
+            return -1
+        if rank == self.MANAGEMENT_MSG_REQUIRED_RANK and not self._allow_management_rank:
+            if self._callbacks.bind_rejected is not None:
+                self._callbacks.bind_rejected(SisBindRejectReason.NOT_ENOUGH_RESOURCES)
+            else:
+                raise ValueError(
+                    "rank=15 (gerência) requer allow_management_rank=True"
+                )
+            return -1
+        # Tabela F-1: SAP 0 é reservado ao Subnet Management Client; só é
+        # acessível a clientes autorizados via ``allow_management_rank``.
+        if sap_id == 0 and not self._allow_management_rank:
+            if self._callbacks.bind_rejected is not None:
+                self._callbacks.bind_rejected(SisBindRejectReason.NOT_ENOUGH_RESOURCES)
+            else:
+                raise ValueError(
+                    "SAP 0 (Subnet Management) requer allow_management_rank=True"
+                )
             return -1
         if sap_id in self._saps:
             if self._callbacks.bind_rejected is not None:
@@ -294,10 +373,12 @@ class StanagNode:
         request_confirm: Callable | None = None,
         request_rejected: Callable | None = None,
         bind_rejected: Callable | None = None,
+        unbind_indication: Callable | None = None,
         hard_link_established: Callable | None = None,
         hard_link_indication: Callable | None = None,
         hard_link_rejected: Callable | None = None,
         hard_link_terminated: Callable | None = None,
+        hard_link_terminated_per_sap: Callable | None = None,
     ) -> None:
         """Registra callbacks para primitivas SIS."""
         if unidata_indication is not None:
@@ -308,6 +389,8 @@ class StanagNode:
             self._callbacks.request_rejected = request_rejected
         if bind_rejected is not None:
             self._callbacks.bind_rejected = bind_rejected
+        if unbind_indication is not None:
+            self._callbacks.unbind_indication = unbind_indication
         if hard_link_established is not None:
             self._callbacks.hard_link_established = hard_link_established
         if hard_link_indication is not None:
@@ -316,6 +399,8 @@ class StanagNode:
             self._callbacks.hard_link_rejected = hard_link_rejected
         if hard_link_terminated is not None:
             self._callbacks.hard_link_terminated = hard_link_terminated
+        if hard_link_terminated_per_sap is not None:
+            self._callbacks.hard_link_terminated_per_sap = hard_link_terminated_per_sap
 
     # -------------------------------------------------------------------
     # SIS: Submissão de dados
@@ -343,7 +428,12 @@ class StanagNode:
             return
 
         dm = mode or DeliveryMode()
-        ttd = time.time() + (ttl_seconds if ttl_seconds > 0 else 7 * 86400)
+        # A.2.1.5 §8: TTL = 0 significa "infinito" — usa float('inf') como
+        # sentinela para sinalizar que a U_PDU nunca expira via TTD/purge.
+        ttd = (
+            float("inf") if ttl_seconds <= 0
+            else time.time() + ttl_seconds
+        )
         tx_mode = TxMode.ARQ if dm.arq_mode else TxMode.NON_ARQ
         if dm.expedited:
             tx_mode = TxMode.EXPEDITED_NON_ARQ
@@ -378,7 +468,18 @@ class StanagNode:
         mode: DeliveryMode | None = None,
         updu: bytes = b"",
     ) -> None:
-        """Submete U_PDU expedited ARQ (tipos 4/5, stop-and-wait)."""
+        """Submete U_PDU expedited ARQ (tipos 4/5, stop-and-wait).
+
+        A.2.1.10§3-4: rastreia o número de expedited requests por cliente; se
+        exceder ``max_expedited_per_client`` o nó desliga unilateralmente o
+        cliente via S_UNBIND_INDICATION reason=4.
+        """
+        if sap_id not in self._saps:
+            self._fire_rejected(sap_id, SisRejectReason.SAP_NOT_BOUND)
+            return
+        if not self.track_expedited_request(sap_id):
+            # SAP foi desligado por exceder o limite; nada mais a fazer.
+            return
         dm = mode or DeliveryMode(arq_mode=True, expedited=True)
         self.unidata_request(
             sap_id, dest_addr, dest_sap,
@@ -409,26 +510,45 @@ class StanagNode:
         self._link_session.remote_sap = remote_sap
         self._link_session.hard_link_owner = sap_id
         self._link_session.hard_link_owner_rank = self._saps[sap_id].rank
-        self._link_session.link_priority = min(15, max(0, link_priority))
-        self._link_session.sis_hard_link_type = link_type & 0x0F
+        self._link_session.local_initiator_sap = sap_id
+        # A.2.1.11 §3: Link Priority limitado a 0-3 (S_PDU tipo 3 carrega 2 bits).
+        self._link_session.link_priority = min(3, max(0, link_priority))
+        self._link_session.sis_hard_link_type = link_type & 0x03
         self._link_session.is_calling = True
         self._we_initiated_link = True
         self.make_link(remote_addr, link_type=PhysicalLinkType.EXCLUSIVE)
 
-    def hard_link_terminate(self, sap_id: int, remote_addr: int) -> None:
-        """Solicita terminação de hard link."""
+    def hard_link_terminate(
+        self,
+        sap_id: int,
+        remote_addr: int,
+        reason: int = int(SisHardLinkTerminateReason.LINK_TERMINATED_BY_REMOTE),
+    ) -> None:
+        """Solicita terminação de hard link.
+
+        A.2.1.12 §2: a sub-rede só termina o link se o cliente que pediu a
+        terminação foi quem o estabeleceu localmente. Se esse nó é apenas o
+        solicitado (Type 0/1, sem dono local), nenhum SAP local pode invocar
+        terminate — só o remoto via TERMINATE recebido.
+
+        ``reason`` (4 bits, ver ``SisHardLinkTerminateReason``) é encodado no
+        S_PDU tipo 6 enviado ao peer.
+        """
         if self._link_session.link_type != LinkType.HARD:
             return
-        if self._link_session.hard_link_owner >= 0 and self._link_session.hard_link_owner != sap_id:
-            return
         if sap_id not in self._saps:
+            return
+        local_initiator = self._link_session.local_initiator_sap
+        if local_initiator < 0 or local_initiator != sap_id:
             return
         self._link_session.state = SisLinkSessionState.TERMINATING
         self._link_session.awaiting_terminate_confirm = True
         self._link_session.terminate_confirm_timeout_ms = (
             self._current_time_ms + self._hard_link_terminate_timeout_ms
         )
-        self._send_control_expedited(remote_addr, encode_spdu_hard_link_terminate(1))
+        self._send_control_expedited(
+            remote_addr, encode_spdu_hard_link_terminate(reason & 0x0F)
+        )
 
     def hard_link_accept(
         self,
@@ -436,8 +556,14 @@ class StanagNode:
         link_type: int,
         remote_addr: int,
         remote_sap: int,
+        local_sap: int | None = None,
     ) -> None:
-        """Aceita hard link tipo 2/3 indicado via S_HARD_LINK_INDICATION (Annex A)."""
+        """Aceita hard link tipo 2 indicado via S_HARD_LINK_INDICATION (Annex A).
+
+        Quando ``local_sap`` é fornecido (SAP local que aceitou a indicação),
+        ele é registrado como ``local_initiator_sap`` da sessão para que
+        ``hard_link_terminate`` reconheça o originador.
+        """
         p = self._link_session.pending_indication
         if p is None or p.src_addr != remote_addr or p.remote_sap != remote_sap:
             return
@@ -446,10 +572,21 @@ class StanagNode:
         self._link_session.remote_addr = p.src_addr
         self._link_session.remote_sap = p.remote_sap
         self._link_session.hard_link_owner = p.remote_sap
+        # Captura o tipo do hard link aceito (Type 2 atualmente, mas o
+        # helper per-sap depende deste campo para distinguir notificações).
+        self._link_session.sis_hard_link_type = p.link_type & 0x03
+        self._link_session.link_priority = p.link_priority & 0x03
+        self._link_session.local_initiator_sap = (
+            local_sap if local_sap is not None and local_sap in self._saps else -1
+        )
         self._link_session.pending_indication = None
         self._send_control_expedited(p.src_addr, encode_spdu_hard_link_confirm())
         if self._callbacks.hard_link_established is not None:
             self._callbacks.hard_link_established(p.src_addr, p.remote_sap)
+        # Indicações ainda em backlog ficam pendentes para o próximo
+        # accept/reject. Como já há link ativo, novas que cheguem entram em
+        # precedência via ``_handle_hard_link_request``.
+        self._promote_next_pending_indication()
 
     def hard_link_reject(
         self,
@@ -465,6 +602,7 @@ class StanagNode:
             return
         self._link_session.pending_indication = None
         self._send_control_expedited(p.src_addr, encode_spdu_hard_link_rejected(reason))
+        self._promote_next_pending_indication()
 
     # -------------------------------------------------------------------
     # SIS: Flow control
@@ -627,7 +765,14 @@ class StanagNode:
             flow_rx("DTS", f"node={self.local_node_address} frame descartado (decode falhou) len={len(frame)}")
             return
         tipo = dpdu.dpdu_type.name if hasattr(dpdu.dpdu_type, "name") else str(dpdu.dpdu_type)
-        warn_reason = self._dts.warning_reason(dpdu.dpdu_type)
+        # C.3.12 §10: nunca responder a um WARNING com outro WARNING. O Tipo 15
+        # não é "esperado" em qualquer estado, mas o tratamento dele é direto
+        # mais abaixo — pular a verificação evita loops de WARNING ⇄ WARNING.
+        warn_reason = (
+            None
+            if dpdu.dpdu_type is DPDUType.WARNING
+            else self._dts.warning_reason(dpdu.dpdu_type)
+        )
         if warn_reason is not None:
             flow_rx(
                 "DTS",
@@ -877,45 +1022,13 @@ class StanagNode:
                 link_type, link_pri, req_sap, remote_sap = decode_spdu_hard_link_request(payload)
             except ValueError:
                 return
-            if self._link_session.link_type == LinkType.HARD and self._link_session.state == SisLinkSessionState.ACTIVE:
-                # Precedence rules (A.3.2.2.1):
-                # 1. Higher rank wins
-                # 2. Same rank: higher link_priority wins
-                # 3. Same rank + priority + same dest: first-come wins
-                # 4. Higher link_type prevails
-                existing_rank = self._link_session.hard_link_owner_rank
-                requester_rank = 0  # remote rank not known from S_PDU, use 0
-                if requester_rank < existing_rank:
-                    return
-                if requester_rank == existing_rank:
-                    if link_pri < self._link_session.link_priority:
-                        return
-                    if link_pri == self._link_session.link_priority:
-                        if link_type <= self._link_session.sis_hard_link_type:
-                            return
-            if link_type == 2 and self._callbacks.hard_link_indication is not None:
-                self._link_session.pending_indication = _PendingHardLinkIndication(
-                    src_addr=src_addr,
-                    remote_sap=remote_sap,
-                    link_priority=link_pri,
-                    link_type=link_type,
-                    requesting_sap=req_sap,
-                )
-                self._callbacks.hard_link_indication(src_addr, remote_sap, link_pri, link_type)
-                return
-            can_accept = remote_sap in self._saps if link_type == 2 else True
-            if can_accept:
-                self._link_session.state = SisLinkSessionState.ACTIVE
-                self._link_session.link_type = LinkType.HARD
-                self._link_session.remote_addr = src_addr
-                self._link_session.remote_sap = remote_sap
-                self._link_session.hard_link_owner = remote_sap if link_type == 2 else -1
-                self._send_control_expedited(src_addr, encode_spdu_hard_link_confirm())
-                if self._callbacks.hard_link_established is not None:
-                    self._callbacks.hard_link_established(src_addr, remote_sap)
-            else:
-                self._send_control_expedited(src_addr, encode_spdu_hard_link_rejected(
-                    int(SisHardLinkRejectReason.DEST_SAP_NOT_BOUND)))
+            self._handle_hard_link_request(
+                src_addr=src_addr,
+                req_sap=req_sap,
+                remote_sap=remote_sap,
+                link_pri=link_pri,
+                link_type=link_type,
+            )
         elif t == SPDU_TYPE_HARD_LINK_ESTABLISH_CONFIRM:
             if self._link_session.awaiting_hard_link_response:
                 self._link_session.awaiting_hard_link_response = False
@@ -938,31 +1051,259 @@ class StanagNode:
                         reason,
                     )
         elif t == SPDU_TYPE_HARD_LINK_TERMINATE:
-            self._link_session.state = SisLinkSessionState.IDLE
-            self._link_session.link_type = LinkType.SOFT
-            self._link_session.hard_link_owner = -1
+            self._last_terminate_reason = decode_spdu_hard_link_terminate(payload)
+            # Captura per-sap notifications antes do reset zerar o tipo/owner.
+            self._notify_hard_link_terminated_per_sap(
+                src_addr, initiator_received_confirm=False,
+            )
+            self._reset_link_session_to_idle()
             self._send_control_expedited(src_addr, encode_spdu_hard_link_terminate_confirm())
             if self._callbacks.hard_link_terminated is not None:
-                self._callbacks.hard_link_terminated(src_addr, initiator_received_confirm=False)
+                self._callbacks.hard_link_terminated(
+                    src_addr,
+                    initiator_received_confirm=False,
+                )
         elif t == SPDU_TYPE_HARD_LINK_TERMINATE_CONFIRM:
             if self._link_session.awaiting_terminate_confirm:
                 self._link_session.awaiting_terminate_confirm = False
-                self._link_session.state = SisLinkSessionState.IDLE
-                self._link_session.link_type = LinkType.SOFT
-                self._link_session.hard_link_owner = -1
+                remote = self._link_session.remote_addr
+                self._notify_hard_link_terminated_per_sap(
+                    remote, initiator_received_confirm=True,
+                )
+                self._reset_link_session_to_idle()
                 if self._callbacks.hard_link_terminated is not None:
                     self._callbacks.hard_link_terminated(
-                        self._link_session.remote_addr,
+                        remote,
                         initiator_received_confirm=True,
                     )
+
+    # -------------------------------------------------------------------
+    # Hard Link helpers (A.3.2.2.1 / A.3.2.2.2)
+    # -------------------------------------------------------------------
+
+    def _reset_link_session_to_idle(self) -> None:
+        """Devolve a sessão de enlace ao estado IDLE/SOFT (sem afetar CAS)."""
+        self._link_session.state = SisLinkSessionState.IDLE
+        self._link_session.link_type = LinkType.SOFT
+        self._link_session.hard_link_owner = -1
+        self._link_session.hard_link_owner_rank = 0
+        self._link_session.link_priority = 0
+        self._link_session.sis_hard_link_type = 0
+        self._link_session.pending_indication = None
+        self._link_session.pending_indications.clear()
+        self._link_session.awaiting_hard_link_response = False
+        self._link_session.awaiting_terminate_confirm = False
+        self._link_session.is_calling = False
+        self._link_session.local_initiator_sap = -1
+
+    def _notify_hard_link_terminated_per_sap(
+        self, remote_addr: int, initiator_received_confirm: bool,
+    ) -> None:
+        """A.3.2.2.3 §3: dispara callback granular para cada SAP afetado.
+
+        Type 0: todos os SAPs locais bound.
+        Type 1/2: apenas o ``local_initiator_sap`` (se conhecido).
+        """
+        cb = self._callbacks.hard_link_terminated_per_sap
+        if cb is None:
+            return
+        link_type = self._link_session.sis_hard_link_type
+        local_initiator = self._link_session.local_initiator_sap
+        if link_type == 0:
+            sap_ids = list(self._saps)
+        elif local_initiator >= 0:
+            sap_ids = [local_initiator]
+        else:
+            sap_ids = []
+        for sap_id in sap_ids:
+            cb(sap_id, remote_addr, initiator_received_confirm)
+
+    def _promote_next_pending_indication(self) -> None:
+        """Promove a próxima indicação Type 2 da fila para ``pending_indication``
+        e dispara ``hard_link_indication`` para o cliente."""
+        if self._link_session.pending_indication is not None:
+            return
+        if not self._link_session.pending_indications:
+            return
+        nxt = self._link_session.pending_indications.pop(0)
+        self._link_session.pending_indication = nxt
+        if self._callbacks.hard_link_indication is not None:
+            self._callbacks.hard_link_indication(
+                nxt.src_addr, nxt.remote_sap, nxt.link_priority, nxt.link_type,
+            )
+
+    def _evaluate_hard_link_precedence(
+        self,
+        *,
+        requester_rank: int,
+        requester_priority: int,
+        requester_link_type: int,
+    ) -> bool:
+        """Aplica regras A.3.2.2.1 §1-§4. Retorna True se o novo pedido vence.
+
+        Regras:
+          1. Maior Rank vence.
+          2. Mesmo Rank: maior Link Priority vence.
+          3. Mesmo Rank + Priority: ``link_type`` mais alto (0 < 1 < 2) vence.
+          4. Empate total: o existente prevalece (first-come).
+        """
+        existing_rank = self._link_session.hard_link_owner_rank
+        if requester_rank > existing_rank:
+            return True
+        if requester_rank < existing_rank:
+            return False
+        if requester_priority > self._link_session.link_priority:
+            return True
+        if requester_priority < self._link_session.link_priority:
+            return False
+        return requester_link_type > self._link_session.sis_hard_link_type
+
+    def _terminate_existing_hard_link(self, reason: int) -> None:
+        """A.3.2.2.2 §8: encerra o Hard Link prévio antes de aceitar novo.
+
+        Envia TERMINATE ao peer corrente, dispara callback ``hard_link_terminated``
+        ao owner local com o reason indicado e zera o estado da sessão.
+        """
+        prev_remote_addr = self._link_session.remote_addr
+        prev_owner = self._link_session.hard_link_owner
+        if prev_remote_addr:
+            self._send_control_expedited(
+                prev_remote_addr,
+                encode_spdu_hard_link_terminate(reason),
+            )
+        self._reset_link_session_to_idle()
+        if self._callbacks.hard_link_terminated is not None:
+            self._callbacks.hard_link_terminated(
+                prev_remote_addr,
+                initiator_received_confirm=False,
+            )
+        # Suprime variáveis não usadas só para clareza.
+        del prev_owner
+
+    def _handle_hard_link_request(
+        self,
+        *,
+        src_addr: int,
+        req_sap: int,
+        remote_sap: int,
+        link_pri: int,
+        link_type: int,
+    ) -> None:
+        """Trata REQUEST recebido conforme A.3.2.2.1 / A.3.2.2.2.
+
+        Sempre envia RESPONSE explícita: CONFIRM (tipo 4) ou REJECTED (tipo 5)
+        com o reason adequado. Type 2 dispara S_HARD_LINK_INDICATION para o
+        SAP destino quando registrado.
+        """
+        requester_rank = self._resolve_remote_rank(src_addr, req_sap)
+        existing_active = (
+            self._link_session.link_type == LinkType.HARD
+            and self._link_session.state == SisLinkSessionState.ACTIVE
+        )
+
+        if existing_active:
+            new_wins = self._evaluate_hard_link_precedence(
+                requester_rank=requester_rank,
+                requester_priority=link_pri,
+                requester_link_type=link_type,
+            )
+            if not new_wins:
+                # A.3.2.2.1 §6: se já existe Hard Link Type 0 prevalece.
+                if self._link_session.sis_hard_link_type == 0:
+                    reason = int(SisHardLinkRejectReason.REQUESTED_TYPE0_EXISTS)
+                else:
+                    reason = int(SisHardLinkRejectReason.HIGHER_PRIORITY_LINK_EXISTING)
+                self._send_control_expedited(
+                    src_addr,
+                    encode_spdu_hard_link_rejected(reason),
+                )
+                return
+            # A.3.2.2.2 §8: novo pedido vence — encerra o existente antes.
+            self._terminate_existing_hard_link(
+                int(SisHardLinkTerminateReason.HIGHER_PRIORITY_LINK_REQUESTED),
+            )
+
+        if link_type == 2 and self._callbacks.hard_link_indication is not None:
+            new_indication = _PendingHardLinkIndication(
+                src_addr=src_addr,
+                remote_sap=remote_sap,
+                link_priority=link_pri,
+                link_type=link_type,
+                requesting_sap=req_sap,
+            )
+            # A.2.1.13: indicações Type 2 podem chegar simultaneamente. A
+            # primeira fica em ``pending_indication`` aguardando accept/reject;
+            # subsequentes vão para ``pending_indications`` (FIFO) até serem
+            # promovidas após resposta.
+            if self._link_session.pending_indication is None:
+                self._link_session.pending_indication = new_indication
+            else:
+                self._link_session.pending_indications.append(new_indication)
+            self._callbacks.hard_link_indication(
+                src_addr, remote_sap, link_pri, link_type,
+            )
+            return
+
+        if link_type == 2 and remote_sap not in self._saps:
+            self._send_control_expedited(
+                src_addr,
+                encode_spdu_hard_link_rejected(
+                    int(SisHardLinkRejectReason.DEST_SAP_NOT_BOUND),
+                ),
+            )
+            return
+
+        # Aceita.
+        self._link_session.state = SisLinkSessionState.ACTIVE
+        self._link_session.link_type = LinkType.HARD
+        self._link_session.remote_addr = src_addr
+        self._link_session.remote_sap = remote_sap
+        self._link_session.hard_link_owner = remote_sap if link_type == 2 else -1
+        self._link_session.hard_link_owner_rank = requester_rank
+        self._link_session.link_priority = link_pri & 0x03
+        self._link_session.sis_hard_link_type = link_type & 0x03
+        # Lado solicitado (called): nenhum SAP local iniciou. Apenas em Type 2
+        # com hard_link_accept() o cliente local opt-in vira "initiator local".
+        self._link_session.local_initiator_sap = -1
+        self._send_control_expedited(src_addr, encode_spdu_hard_link_confirm())
+        if self._callbacks.hard_link_established is not None:
+            self._callbacks.hard_link_established(src_addr, remote_sap)
 
     def _wrap_in_cpdu(self, spdu_payload: bytes) -> bytes:
         """Encapsula S_PDU em C_PDU DATA (tipo 0) para transporte non-ARQ."""
         return encode_cpdu(CPDU(cpdu_type=CPDUType.DATA, payload=spdu_payload))
 
+    def _cas_arq_data_handler(self, dest_addr: int, encoded_cpdu: bytes) -> None:
+        """Despacha DATA C_PDU via ARQ a pedido do CAS (B.3.1 §5-7).
+
+        Invocado por ``CASEngine.send_data(use_arq=True)``. Sincroniza o
+        endereço remoto da engine ARQ e envia o C_PDU já encapsulado para a
+        fila ARQ regular.
+        """
+        if self.arq.remote_node_address != dest_addr:
+            self.arq.remote_node_address = dest_addr
+        self._dts.enter_data()
+        self.arq.submit_cpdu(encoded_cpdu)
+
     def _send_control_expedited(self, dest_addr: int, payload: bytes) -> None:
-        """Envia S_PDU de controle via expedited (Annex A A.3.2.2.1)."""
-        self.non_arq.queue_cpdu(DPDUType.EXPEDITED_NON_ARQ, dest_addr, self._wrap_in_cpdu(payload))
+        """Envia S_PDU de controle Hard Link.
+
+        A.3.2.2.2 §11 exige Expedited ARQ (D_PDU tipo 4) com confirmação
+        stop-and-wait quando o Physical Link já está MADE. Caso o CAS ainda
+        não esteja MADE (ex.: REJECT enviado pré-handshake), recorre a
+        Expedited Non-ARQ (D_PDU tipo 8) como fallback.
+        """
+        cpdu_bytes = self._wrap_in_cpdu(payload)
+        if (
+            self.cas.state == CasLinkState.MADE
+            and self.cas.remote_node_address is not None
+            and self.cas.remote_node_address == dest_addr
+        ):
+            self.expedited_arq.remote_node_address = dest_addr
+            self.expedited_arq.submit_cpdu(cpdu_bytes)
+            self._dts.enter_expedited()
+            return
+        self.non_arq.queue_cpdu(DPDUType.EXPEDITED_NON_ARQ, dest_addr, cpdu_bytes)
 
     def _process_delivery_confirm_or_fail(self, payload: bytes, src_addr: int, spdu_t: int) -> None:
         """Processa S_PDU tipo 1 (CONFIRM) ou 2 (FAIL)."""
@@ -999,11 +1340,13 @@ class StanagNode:
             self._callbacks.unidata_indication(indication)
         if spdu.client_delivery_confirm_required:
             updu_partial = spdu.updu[:32] if spdu.updu else b""
+            # A.3.1.2 §7 / A.3.1.3: CONFIRM/FAIL replicam todos os campos
+            # S_PCI do DATA original (PRIORITY, VALID_TTD, JULIAN, GMT, ...).
             if success:
-                payload = encode_spdu_data_delivery_confirm(spdu.src_sap, spdu.dest_sap, updu_partial)
+                payload = encode_spdu_data_delivery_confirm_from(spdu, updu_partial)
             else:
-                payload = encode_spdu_data_delivery_fail(
-                    spdu.src_sap, spdu.dest_sap,
+                payload = encode_spdu_data_delivery_fail_from(
+                    spdu,
                     int(SisDataDeliveryFailReason.DEST_SAP_NOT_BOUND),
                     updu_partial,
                 )
@@ -1218,13 +1561,24 @@ class StanagNode:
     # -------------------------------------------------------------------
 
     def track_expedited_request(self, sap_id: int) -> bool:
-        """Track expedited request count. Returns False if limit exceeded."""
+        """Track expedited request count. Returns False if limit exceeded.
+
+        A.2.1.10§3-4: ao exceder o limite, o nó desliga o SAP via
+        S_UNBIND_INDICATION com REASON=4 ("Too many expedited-data request
+        primitives") e retorna False.
+        """
         if self._max_expedited_per_client <= 0:
             return True  # tracking disabled
         count = self._expedited_counts.get(sap_id, 0) + 1
         self._expedited_counts[sap_id] = count
         if count > self._max_expedited_per_client:
             self.unbind(sap_id)
+            self._expedited_counts.pop(sap_id, None)
+            if self._callbacks.unbind_indication is not None:
+                self._callbacks.unbind_indication(
+                    sap_id,
+                    SisUnbindIndicationReason.TOO_MANY_EXPEDITED_REQUESTS,
+                )
             return False
         return True
 

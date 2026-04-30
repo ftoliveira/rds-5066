@@ -236,7 +236,9 @@ from src.dpdu_frame import (
 )
 from src.modem_if import ModemInterface
 from src.flow_log import flow_tx, payload_hint
-from src.stypes import DPDU, DPDUType, NonArqDelivery, NonArqDeliveryKind
+from src.stypes import (
+    DPDU, DPDUType, NonArqDelivery, NonArqDeliveryKind, NonArqDeliveryMode,
+)
 
 
 DEFAULT_NON_ARQ_SEGMENT_BYTES = 200
@@ -278,6 +280,7 @@ class NonArqEngine:
         default_cpdu_reception_window_hs: int = DEFAULT_CPDU_RECEPTION_WINDOW_HS,
         half_duplex: bool = True,
         delivery_handler: Callable[[NonArqDelivery], None] | None = None,
+        delivery_mode: NonArqDeliveryMode = NonArqDeliveryMode.DELIVER_W_ERRORS,
     ) -> None:
         self.local_node_address = local_node_address
         self.modem = modem
@@ -285,6 +288,9 @@ class NonArqEngine:
         self.default_cpdu_reception_window_hs = default_cpdu_reception_window_hs
         self.half_duplex = half_duplex
         self.delivery_handler = delivery_handler
+        # C.3.13 §10-11: ERROR_FREE descarta fragmentos parciais expirados;
+        # DELIVER_W_ERRORS entrega-os marcados com complete=False.
+        self.delivery_mode = delivery_mode
 
         self._tx_queue_expedited: deque[_TxRequest] = deque()
         self._tx_queue_normal: deque[_TxRequest] = deque()
@@ -539,6 +545,11 @@ class NonArqEngine:
         ]
         for key in expired_keys:
             assembly = self._rx_assemblies.pop(key)
+            # C.3.13 §10-11: em modo ERROR_FREE descartamos silenciosamente as
+            # remontagens incompletas. Em DELIVER_W_ERRORS entregamos o
+            # fragmento parcial com ``complete=False``.
+            if self.delivery_mode == NonArqDeliveryMode.ERROR_FREE:
+                continue
             partial_payload = bytes(
                 assembly.buffer[idx]
                 for idx, present in enumerate(assembly.received)

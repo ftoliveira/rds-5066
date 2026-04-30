@@ -181,17 +181,30 @@ class EtherClient(SubnetClient):
         """Atalho para ARP-over-Ether (F.11.5.4, Ethertype=0x0806, non-ARQ)."""
         self.send_frame(dest_addr, ETHERTYPE_ARP, arp_packet, arq=False, **kw)
 
-    def send_ppp(self, dest_addr: int, ppp_frame: bytes, **kw) -> None:
-        """Atalho para PPP-over-Ether (F.11.5.5, Ethertype=0x880B, ARQ, in-order)."""
-        # F.11.5.5: PPP requires in-order delivery
-        from src.stypes import DeliveryMode as _DM
-        mode = _DM(arq_mode=True, in_order=True)
+    def send_ppp(
+        self,
+        dest_addr: int,
+        ppp_frame: bytes,
+        priority: int = 5,
+        ttl_seconds: float = 120.0,
+    ) -> None:
+        """Atalho para PPP-over-Ether (F.11.5.5, Ethertype=0x880B, ARQ, in-order).
+
+        F.11.5.5 §1-§3 exige ARQ + IN-ORDER por default; a assinatura é
+        explícita (sem ``**kw``) para evitar `TypeError` em chamadas mínimas.
+        """
+        mode = DeliveryMode(arq_mode=True, in_order=True)
         self._send_data(
             dest_addr=dest_addr,
             dest_sap=self.SAP_ID,
             data=encode_ec_frame(EtherFrame(ETHERTYPE_PPP, ppp_frame)),
+            priority=priority,
+            ttl_seconds=ttl_seconds,
             mode=mode,
-            **kw,
+        )
+        logger.debug(
+            "EtherClient → addr=%d PPP %d bytes (ARQ+InOrder)",
+            dest_addr, len(ppp_frame),
         )
 
     # ── Recepção ──────────────────────────────────────────────────────────────

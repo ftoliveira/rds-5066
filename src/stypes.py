@@ -76,6 +76,20 @@ class NonArqDeliveryKind(StrEnum):
     PARTIAL = "PARTIAL"
 
 
+class NonArqDeliveryMode(StrEnum):
+    """Modo de entrega Non-ARQ (C.3.13 §10-11).
+
+    ERROR_FREE      — apenas C_PDUs completas e válidas são entregues; os
+                       fragmentos parciais expirados são descartados.
+    DELIVER_W_ERRORS — fragmentos parciais expirados também são entregues
+                       (com ``complete=False``), conforme prática "deliver
+                       with errors".
+    """
+
+    ERROR_FREE = "ERROR_FREE"
+    DELIVER_W_ERRORS = "DELIVER_W_ERRORS"
+
+
 DATA_DPDU_TYPES = {
     DPDUType.DATA_ONLY,
     DPDUType.DATA_ACK,
@@ -380,6 +394,15 @@ class SisBindRejectReason(IntEnum):
     INVALID_SAP_ID = 2
     SAP_ALREADY_ALLOCATED = 3
     ARQ_MODE_UNSUPPORTABLE = 4  # Edition 3
+
+
+class SisUnbindIndicationReason(IntEnum):
+    """Razões S_UNBIND_INDICATION (Annex A A.2.1.4 / A.2.1.10§3-4)."""
+
+    NODE_RESOURCES_EXHAUSTED = 1
+    PEER_DISCONNECT = 2
+    NODE_SHUTDOWN = 3
+    TOO_MANY_EXPEDITED_REQUESTS = 4  # A.2.1.10§3-4
 
 
 class LinkType(StrEnum):

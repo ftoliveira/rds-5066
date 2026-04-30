@@ -238,11 +238,45 @@ class HFPOP3Server(SubnetClient):
         self._current_user = ""
         self._user_messages: list[StoredMessage] = []
 
+        # Conjunto de peers que já receberam o greeting espontâneo na sessão
+        # corrente (RFC 1939 / F.6: greeting é enviado pelo servidor ao
+        # estabelecer a conexão, não em resposta a um comando do cliente).
+        self._greeted_peers: set[int] = set()
+
+    def send_greeting_to(self, dest_addr: int,
+                         priority: int = 10,
+                         ttl_seconds: float = 120.0) -> None:
+        """Envia o greeting POP3 espontaneamente para ``dest_addr``.
+
+        Deve ser chamado pelo orquestrador imediatamente após o
+        ``S_HARD_LINK_ESTABLISHED`` (ou no bind do SAP em testes). Marca o
+        peer como "greeted" para evitar duplicação no primeiro UNIDATA.
+        """
+        greeting = self.get_greeting()
+        self._greeted_peers.add(dest_addr)
+        self._send_data(
+            dest_addr=dest_addr,
+            dest_sap=self.SAP_ID,
+            data=greeting,
+            priority=priority,
+            ttl_seconds=ttl_seconds,
+            mode=DeliveryMode(arq_mode=True, node_delivery_confirm=True),
+        )
+
     def _on_data_received(self, src_addr: int, data: bytes):
         """Parse e processa comandos POP3."""
         text = data.decode("utf-8", errors="replace")
         lines = text.split("\r\n")
         response = b""
+
+        # F.6 / RFC 1939: o servidor envia o greeting (com timestamp APOP)
+        # espontaneamente ao aceitar a conexão. Se não fomos avisados pelo
+        # orquestrador via ``send_greeting_to``, emitimos no primeiro
+        # contato e marcamos o peer como cumprimentado.
+        if src_addr not in self._greeted_peers \
+                and self._state == POP3State.AUTHORIZATION:
+            response += self.get_greeting()
+            self._greeted_peers.add(src_addr)
 
         for line in lines:
             line = line.strip()
@@ -276,9 +310,10 @@ class HFPOP3Server(SubnetClient):
         """Processa um comando e retorna resposta."""
 
         if cmd.keyword == "NOOP":
-            # Em AUTHORIZATION, responde com saudação (inclui timestamp para APOP)
-            if self._state == POP3State.AUTHORIZATION:
-                return self.get_greeting()
+            # RFC 1939 §5: NOOP sempre responde com +OK simples. O greeting é
+            # emitido espontaneamente pelo servidor ao iniciar a sessão (ver
+            # ``send_greeting_to`` e o prepend em ``_on_data_received``); não
+            # depende mais de NOOP como gatilho.
             return format_pop3_ok("OK")
 
         if cmd.keyword == "APOP":

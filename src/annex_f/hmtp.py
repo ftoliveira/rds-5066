@@ -61,7 +61,23 @@ class HMTPClient(SubnetClient):
     def send_batch(self, dest_addr: int, hostname: str,
                    messages: list[MailMessage],
                    priority: int = 10, ttl_seconds: float = 300.0) -> None:
-        """Envia EHLO + batch de mensagens HMTP em uma única transmissão (F.5)."""
+        """Envia EHLO + batch de mensagens HMTP em uma única transmissão (F.5).
+
+        RFC 5321 §3.3: cada transação SMTP exige pelo menos um RCPT TO. F.5
+        herda esta exigência; mensagens com ``recipients=[]`` ou sender vazio
+        são rejeitadas para evitar transações inválidas no ar.
+        """
+        if not messages:
+            raise ValueError("HMTP send_batch: lista de mensagens vazia")
+        for idx, msg in enumerate(messages):
+            if not msg.recipients:
+                raise ValueError(
+                    f"HMTP send_batch: mensagem #{idx} sem recipients (RFC 5321 §3.3)"
+                )
+            if not msg.sender:
+                raise ValueError(
+                    f"HMTP send_batch: mensagem #{idx} sem sender"
+                )
         buf = f"EHLO {hostname}\r\n".encode("utf-8")
 
         if len(messages) > 1:

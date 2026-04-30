@@ -380,12 +380,22 @@ class RawSisSocketServer:
 
         def on_established(remote_addr, remote_sap):
             if self._sap_to_conn.get(sap_id) == conn_id:
-                # NOTE: StanagNode does not expose link_type/link_priority in this callback;
-                # using session defaults. link_priority=5 is a default, not the negotiated value.
+                # Lê os valores realmente negociados em ``_link_session``;
+                # se a sessão estiver entre transições, usa 0 (default seguro
+                # para nibbles do S_PDU tipo 3).
+                session = getattr(self.node, "_link_session", None)
+                link_type = (
+                    int(getattr(session, "sis_hard_link_type", 0)) & 0x03
+                    if session is not None else 0
+                )
+                link_priority = (
+                    int(getattr(session, "link_priority", 0)) & 0x03
+                    if session is not None else 0
+                )
                 _send_to_conn(encode_hard_link_established(
                     remote_node_status=0,
-                    link_type=0,
-                    link_priority=5,
+                    link_type=link_type,
+                    link_priority=link_priority,
                     remote_sap=remote_sap,
                     remote_node=remote_addr,
                 ))
@@ -446,10 +456,27 @@ class RawSisSocketServer:
             logger.warning("Client %d: write failed, connection lost", conn.conn_id)
 
     def _cleanup_client(self, conn: _ClientConnection):
-        """Limpa estado do cliente desconectado."""
+        """Limpa estado do cliente desconectado.
+
+        F.16 / A.2.1: ao desconectar um cliente TCP que ainda tinha SAP
+        vinculado, emitimos ``S_UNBIND_INDICATION`` para o cliente (best
+        effort — pode falhar se o socket já fechou) e fazemos ``unbind``
+        no nó para liberar o SAP de imediato.
+        """
         if conn.bound_sap is not None:
-            self._sap_to_conn.pop(conn.bound_sap, None)
-            logger.info("Client %d disconnected (was SAP %d)", conn.conn_id, conn.bound_sap)
+            sap_id = conn.bound_sap
+            self._sap_to_conn.pop(sap_id, None)
+            try:
+                # PEER_DISCONNECT (=2): cliente fechou inesperadamente.
+                self._send_raw(conn, encode_unbind_indication(reason=2))
+            except Exception:
+                # Socket pode estar fechado; não propaga.
+                pass
+            try:
+                self.node.unbind(sap_id)
+            except Exception:
+                pass
+            logger.info("Client %d disconnected (was SAP %d)", conn.conn_id, sap_id)
         else:
             logger.info("Client %d disconnected (unbound)", conn.conn_id)
 
