@@ -1,10 +1,10 @@
 # Relatório de Conformidade — STANAG 5066 Edição 3
 
 **Data inicial:** 2026-04-30
-**Última revisão:** 2026-04-30 (após Sprint 5)
+**Última revisão:** 2026-06-24 (após Sprint 7 — MÉDIA-C1 / MÉDIA-A1 + hard link per-sap)
 **Repositório:** `rds-5066`
 **Norma de referência:** STANAG 5066 Edição 3 — Anexos A, B, C, F (`docs/STANAG_5066_v3_ANEXO_*.md`)
-**Cobertura de testes:** **567 testes pytest passando** (zero regressões)
+**Cobertura de testes:** **602 testes pytest passando** (zero regressões)
 
 ---
 
@@ -12,28 +12,32 @@
 
 A implementação está **100 % operante** e cobre o núcleo do protocolo (CRC-16/32 com vetores oficiais validados, sincronização Maury-Styles 0xEB90, enums DPDUType/CPDUType bit-corretos, ARQ sliding-window e Expedited stop-and-wait conformantes, Raw SIS Socket TCP/5066, todos os clientes Anexo F principais).
 
-Auditoria independente (4 agentes especialistas + revisão direta) identificou inicialmente **55 itens de não-conformidade**. Após **5 sprints de correção em ciclos consecutivos**, o status final é:
+Auditoria independente (4 agentes especialistas + revisão direta) identificou inicialmente **55 itens de não-conformidade**. Após **7 sprints de correção em ciclos consecutivos**, o status final é:
 
-| Severidade | Total inicial | ✅ Corrigido | ⚠️ Deferido / sem ação | **Restante** |
+| Severidade | Total inicial | ✅ Corrigido | ⚠️ Sem ação | **Restante** |
 |---|:-:|:-:|:-:|:-:|
 | **CRÍTICA** | 4 | 4 | 0 | **0** |
 | **ALTA**    | 13 | 13 | 0 | **0** |
-| **MÉDIA**   | 20 | 16 | 4 | **4** |
+| **MÉDIA**   | 20 | 20 | 0 | **0** |
 | **BAIXA**   | 18 | 13 | 5 | **5** |
-| **TOTAL**   | 55 | 46 | 9 | **9** |
+| **TOTAL**   | 55 | 50 | 5 | **5** |
 
-**Conformidade estimada: ~98 %**. Todos os itens **CRÍTICA** e **ALTA** foram tratados — implementação está **pronta para interoperabilidade real** com nós conformantes. Itens deferidos/sem ação são robustez interna ou validações visuais contra figuras da norma.
+**Conformidade estimada: ~99 %**. Todos os itens **CRÍTICA**, **ALTA** e **MÉDIA** foram tratados — implementação está **pronta para interoperabilidade real** com nós conformantes. Os 5 itens **BAIXA** restantes são robustez interna sem impacto em interop (decoders já liberais, valores reservados sempre válidos).
+
+> **Sprint 7 (esta revisão):** as duas MÉDIAs antes deferidas (MÉDIA-A1, MÉDIA-C1) foram **resolvidas** após leitura direta das figuras da norma já presentes no repositório (`docs/images_anexo_*/`) — não dependiam de fontes externas. Ambas revelaram **não-conformidade real de layout de bits** (não mera ambiguidade). Também foi fechada a *limitação conhecida* da Sprint 6 (hard link per-sap na tomada por precedência).
 
 | Métrica | Valor |
 |---|---|
 | Testes ao início da auditoria | 450 |
-| Testes ao final da Sprint 5   | **567** |
-| Casos de teste adicionados nas sprints | **117** |
-| Arquivos fonte modificados (Sprints 1–5) | 17 |
+| Testes ao final da Sprint 5   | 567 |
+| Testes ao final da Sprint 6   | 584 |
+| Testes ao final da Sprint 7   | **602** |
+| Casos de teste adicionados nas sprints | **152** |
+| Arquivos fonte modificados (Sprints 1–7) | 19 |
 | Arquivos fonte novos | 0 (mudanças incrementais) |
 | Arquivos fonte removidos (deprecated) | 2 (`phase3_node.py`, `phase4_node.py`) |
-| Arquivos de teste novos | 5 (`test_sprint1..5_*_fixes.py`) |
-| Linhas de código alteradas (estimado) | ~1500 |
+| Arquivos de teste novos | 8 (`test_sprint1..5_*_fixes.py`, `test_media_f2_dispatcher.py`, `test_media_b2_received_cpdus.py`, `test_sprint7_conformance_fixes.py`) |
+| Linhas de código alteradas (estimado) | ~1820 |
 
 ---
 
@@ -65,7 +69,9 @@ Auditoria independente (4 agentes especialistas + revisão direta) identificou i
 | **Limite Expedited Requests aplicado (S_UNBIND_INDICATION reason=4)** | A.2.1.10 §3-4 | ✅ Sprint 1 |
 | **TERMINATE de Hard Link prévio antes de aceitar novo** | A.3.2.2.2 §8 | ✅ Sprint 1 |
 | **REJECT explícito + tabela rank-por-remote-sap** | A.3.2.2.1 §1-§6 | ✅ Sprint 1 |
-| 567 testes pytest passando | — | ✅ |
+| **EOW TYPE field nos bits 11-8 (4 MSB)** | C.5 §2 / Fig C-37 / C-38 | ✅ Sprint 7 (`eow.py`, `stypes.py`, `dpdu_frame.py`) |
+| **SERVICE_TYPE / DELIVERY_MODE: TX 4 bits + MIN-RETX byte1[7:4]** | A.2.2.28.2 / Fig A-3 / A-29 | ✅ Sprint 7 (`s_primitive_codec.py`) |
+| 602 testes pytest passando | — | ✅ |
 
 ---
 
@@ -168,11 +174,42 @@ Auditoria independente (4 agentes especialistas + revisão direta) identificou i
 
 ---
 
+### Sprint 6 — 2 MÉDIAs de refator interno (F.16 / DTS)
+
+**Objetivo:** Eliminar a cadeia de callbacks frágil do Raw SIS Socket e a semântica mista de `received_cpdus`.
+
+| ID | Cláusula | Arquivo | Mudança |
+|---|---|---|---|
+| **MÉDIA-F2** | A.2.1 / F.16 | `raw_sis_socket.py` (nova classe `AnnexFDispatcher`) | Substitui os métodos `_install_sap_callback` / `_install_hard_link_callbacks` (instalados **por bind**) por um `AnnexFDispatcher` registrado **uma única vez** no nó. O roteamento consulta a tabela viva `_sap_to_conn`; SAPs sem conexão socket são delegados ao callback de host capturado na instalação. |
+| **MÉDIA-B2** | — | `stanag_node.py` | `received_cpdus` (semântica mista) separado em `received_data_cpdus` (DATA via ARQ/Expedited, consumido por `_process_rx`) e `received_control_cpdus` (controle via Non-ARQ, arquivado). `received_cpdus` vira *property* somente-leitura combinada (compat). |
+
+**MÉDIA-F2 — dois defeitos reais corrigidos:**
+1. **Cadeia de `unidata_indication` crescia sem limite** — cada bind reembrulhava o callback anterior num novo closure, nunca desfeito no unbind/disconnect (vazamento de closures apontando para conexões mortas). Agora o roteamento é 100 % orientado por tabela: adicionar/remover cliente é só atualizar `_sap_to_conn`.
+2. **Callbacks de hard link eram *sobrescritos* a cada bind** — apenas o último cliente a dar bind recebia eventos de hard link, e os callbacks do host eram perdidos. O dispatcher roteia: *established*/*rejected* → `local_initiator_sap` (A.2.1.12 §2); *indication* → SAP local destino; *terminated* → callback granular `hard_link_terminated_per_sap` (A.3.2.2.3 §3); callback global de terminação encadeia só ao host.
+
+**Resultado:** +17 testes (`tests/test_media_f2_dispatcher.py` ×11, `tests/test_media_b2_received_cpdus.py` ×6), **584 totais**. 2 testes pré-existentes ajustados para a API central (`test_raw_sis_hard_link.py`: terminação agora via *per_sap*; `test_sprint5_baixa_fixes.py`: `_install_hard_link_callbacks` → `_dispatcher.install()` + `local_initiator_sap`).
+
+---
+
+### Sprint 7 — 2 MÉDIAs deferidas resolvidas (figuras da norma) + limitação de hard link
+
+**Objetivo:** Resolver os dois itens MÉDIA antes deferidos por suposta dependência de "fontes externas". As figuras já estavam no repositório (`docs/images_anexo_*/`); a leitura direta confirmou que ambos eram **bugs reais de layout de bits**, e não ambiguidades. Também fechar a limitação conhecida da Sprint 6.
+
+| ID | Cláusula | Arquivo | Mudança |
+|---|---|---|---|
+| **MÉDIA-C1** | C.5 §2, Fig C-37 / C-38 | `eow.py`, `stypes.py`, `dpdu_frame.py`, `management.py` | Campo **TYPE do EOW movido para os bits 11-8** (4 MSB) e o conteúdo para os bits 7-0, conforme texto normativo ("the first 4 bits of the EOW shall contain the EOW-type field") e Figuras C-37/C-38. Antes, `build_eow_drc/_response/_unrecognized/_capability` e `parse_eow` usavam o nibble baixo — **inconsistente** com o Type 7 (já correto desde a Sprint 3). Sites coordenados: properties `DPDUManagement.msg_type/message_contents` (`stypes.py`), `build_management` (`dpdu_frame.py`) e extrações em `send_drc_request/response` (`management.py`). |
+| **MÉDIA-A1** | A.2.2.28.2, Fig A-3 / A-29 | `s_primitive_codec.py` | Layout de **SERVICE_TYPE / DELIVERY_MODE** corrigido para a Fig A-3 (idêntica à A-29): byte 0 = `TX_MODE[7:4]` (4 bits) \| `CONFIRM[3:2]` \| `ORDER[1]` \| `EXT[0]`; byte 1 = `MIN. No OF RETXS[7:4]` (Non-ARQ). `encode_service_type` tratava transmission mode como **2 bits** em `[15:14]` e min-retx em `[9:6]` — posições erradas. `encode_delivery_mode` ganhou parâmetro opcional `min_retransmissions` (2º byte) e `decode_delivery_mode` o flag `with_min_retx`, sem alterar o enquadramento fixo de 1 byte do S_UNIDATA_REQUEST. |
+| **Limitação HL** | A.3.2.2.3 §3 | `stanag_node.py:_terminate_existing_hard_link` | Na tomada de hard link por precedência, agora invoca `_notify_hard_link_terminated_per_sap` **antes** do reset — clientes socket recebem `S_HARD_LINK_TERMINATED` granular nesse sub-caso (antes só o callback global era disparado). |
+
+**Resultado:** +18 testes (`tests/test_sprint7_conformance_fixes.py`), **602 totais**. 1 teste pré-existente ajustado: `test_s_primitive_codec.py::test_bit_layout` reescrito para o layout correto da Fig A-3 (`0x26 0x50`). Nenhum outro teste regrediu — os round-trips EOW/management passam por encoder+decoder corrigidos em conjunto.
+
+---
+
 ## 4. Mudanças Estruturais Consolidadas
 
 ### Arquivos fonte modificados
 
-`src/stanag_node.py`, `src/sis.py`, `src/stypes.py`, `src/cas.py`, `src/arq.py`, `src/expedited_arq.py`, `src/non_arq.py`, `src/dpdu_frame.py`, `src/dts_state.py`, `src/eow.py`, `src/s_primitive_codec.py`, `src/raw_sis_socket.py`, `src/__init__.py`, `src/annex_f/rcop.py`, `src/annex_f/bftp.py`, `src/annex_f/cftp.py`, `src/annex_f/hmtp.py`, `src/annex_f/hf_pop3.py`, `src/annex_f/ether_client.py`, `src/annex_f/ip_client.py`, `src/annex_f/fab.py`.
+`src/stanag_node.py`, `src/sis.py`, `src/stypes.py`, `src/cas.py`, `src/arq.py`, `src/expedited_arq.py`, `src/non_arq.py`, `src/dpdu_frame.py`, `src/dts_state.py`, `src/eow.py`, `src/management.py`, `src/s_primitive_codec.py`, `src/raw_sis_socket.py`, `src/__init__.py`, `src/annex_f/rcop.py`, `src/annex_f/bftp.py`, `src/annex_f/cftp.py`, `src/annex_f/hmtp.py`, `src/annex_f/hf_pop3.py`, `src/annex_f/ether_client.py`, `src/annex_f/ip_client.py`, `src/annex_f/fab.py`.
 
 ### Removidos como deprecated
 
@@ -215,6 +252,9 @@ Auditoria independente (4 agentes especialistas + revisão direta) identificou i
 - `sis.decode_spdu_data_delivery_confirm_full(data)` / `..._fail_full(data)`
 - `hard_link_terminate(..., reason=...)` (parâmetro novo)
 - `hard_link_accept(..., local_sap=None)` (parâmetro novo)
+- `encode_delivery_mode(..., min_retransmissions: int \| None = None)` / `decode_delivery_mode(..., with_min_retx=False)` (Sprint 7 / MÉDIA-A1 — 2º byte opcional Non-ARQ)
+- `raw_sis_socket.AnnexFDispatcher` (roteador central, Sprint 6 / MÉDIA-F2)
+- `StanagNode.received_data_cpdus` / `received_control_cpdus` (Sprint 6 / MÉDIA-B2); `StanagNode.received_cpdus` agora é *property* combinada somente-leitura (*deprecated*)
 
 ### Modernização
 
@@ -227,40 +267,28 @@ Auditoria independente (4 agentes especialistas + revisão direta) identificou i
 - `tests/test_sprint3_alta_fixes.py` — 30 testes
 - `tests/test_sprint4_media_fixes.py` — 31 testes
 - `tests/test_sprint5_baixa_fixes.py` — 22 testes
-- **Total:** 117 casos novos
+- `tests/test_media_f2_dispatcher.py` — 11 testes (Sprint 6)
+- `tests/test_media_b2_received_cpdus.py` — 6 testes (Sprint 6)
+- `tests/test_sprint7_conformance_fixes.py` — 18 testes (Sprint 7)
+- **Total:** 152 casos novos
 
 ### Testes pré-existentes ajustados
 
 - `tests/test_dts_corrections.py` — 4 valores de `rx_lwe` corrigidos para `seq+1` (Sprint 2).
 - `tests/test_stanag_node_sis.py` — 1 teste atualizado para usar `allow_management_rank=True` (Sprint 3).
+- `tests/test_raw_sis_hard_link.py` — terminação roteada via `hard_link_terminated_per_sap` (Sprint 6).
+- `tests/test_s_primitive_codec.py` — `test_bit_layout` reescrito para o layout Fig A-3 correto (Sprint 7).
+- `tests/test_sprint5_baixa_fixes.py` — MÉDIA-F3 usa `_dispatcher.install()` + `local_initiator_sap` (Sprint 6).
 
 ---
 
-## 5. Não-Conformidades Restantes (9 itens)
+## 5. Não-Conformidades Restantes (5 itens)
 
-Todas são **MÉDIA/BAIXA** que não impactam interop real entre nós conformantes — apenas robustez interna ou validações visuais contra figuras da norma.
+Restam apenas **5 itens BAIXA** que não impactam interop real entre nós conformantes — robustez interna onde o comportamento já é conforme (decoders liberais, valores reservados sempre válidos).
 
-### MÉDIA (4 deferidas)
-
-#### MÉDIA-A1 — `min_retransmissions` no Delivery Mode codec
-- **Cláusula:** A.2.2.28.2 (Fig A-29)
-- **Local:** `src/s_primitive_codec.py:91-107`
-- **Razão da deferição:** Fig A-29 é apenas imagem; não foi possível confirmar bit-exatamente o tamanho do campo Delivery Mode sem inspeção visual. Codec atual (1 byte com TM/DC/order/ext) é consistente com o resto do protocolo.
-- **Próximo passo:** Validação visual contra Fig A-29 ou cross-check com vetor de outro implementador.
-
-#### MÉDIA-B2 — `received_cpdus` semântica mista no `StanagNode`
-- **Local:** `src/stanag_node.py:595-596` (Non-ARQ) vs `:609` (ARQ)
-- **Razão:** refator afeta API testada externamente; recomenda-se separar em `received_data_cpdus` e `received_control_cpdus` em sprint dedicada.
-
-#### MÉDIA-C1 — Posição do TYPE field dentro do EOW de 12 bits ambígua para Tipos 1-4
-- **Cláusula:** C.5 §4
-- **Local:** `eow.py:build_eow_drc/...`
-- **Razão:** norma textual não esclarece se TYPE está nos 4 LSB ou 4 MSB do EOW; código segue convenção LSB para Tipos 0-4 e MSB para Tipo 7 (Tabela C-9-1 explícita). Sprint 3 corrigiu Tipo 7 com posição certa.
-- **Próximo passo:** vetor cruzado de outro implementador conformante para confirmar Tipos 1-4.
-
-#### MÉDIA-F2 — Raw SIS Socket: callback chain frágil
-- **Local:** `src/raw_sis_socket.py:347-369`
-- **Razão:** refator significativo (usar `AnnexFDispatcher` central em vez de cadeia de callbacks); ficou para sprint focada em raw_sis_socket.
+> **MÉDIA-A1 e MÉDIA-C1 — RESOLVIDAS na Sprint 7** (ver §3). Eram tratadas como deferidas "aguardando inspeção visual de figuras / vetor de outro implementador", mas as figuras (`docs/images_anexo_A/media/image33.png` = Fig A-29; `.../image7.png` = Fig A-3; `docs/images_anexo_C/media/image41.png` = Fig C-37; `image42.png` = Fig C-38) já estavam no repositório. A leitura confirmou **layout de bits errado** em ambos: o TYPE do EOW estava no nibble baixo (deveria estar em [11:8]) e o `encode_service_type` tratava transmission mode como 2 bits (deveriam ser 4). Corrigidos e cobertos por `tests/test_sprint7_conformance_fixes.py`.
+>
+> **MÉDIA-F2 e MÉDIA-B2 — RESOLVIDAS na Sprint 6** (ver §3). F2: Raw SIS Socket migrado para `AnnexFDispatcher` central (fim da cadeia de callbacks por-bind que vazava closures e sobrescrevia hard links entre clientes). B2: `received_cpdus` separado em `received_data_cpdus`/`received_control_cpdus`.
 
 ### BAIXA (5 sem ação prática)
 
@@ -276,11 +304,11 @@ Todas são **MÉDIA/BAIXA** que não impactam interop real entre nós conformant
 
 ## 6. Recomendação Final
 
-A implementação atende **rigorosamente** os requisitos críticos da Edição 3 e está **pronta para testes de interoperabilidade** entre nós conformantes. Os 9 itens restantes são todos MÉDIA/BAIXA de robustez secundária; nenhum bloqueia operação real ou interop com peers padrão.
+A implementação atende **rigorosamente** os requisitos críticos da Edição 3 e está **pronta para testes de interoperabilidade** entre nós conformantes. Os 5 itens restantes são todos **BAIXA** de robustez secundária; nenhum bloqueia operação real ou interop com peers padrão. Todos os itens CRÍTICA, ALTA e MÉDIA foram tratados.
 
 Trabalho contínuo opcional:
-1. **Sprint 6 (validação externa):** vetores cruzados de outro implementador conformante (resolve MÉDIA-C1) e inspeção visual contra Fig A-29 (resolve MÉDIA-A1).
-2. **Refator pontual:** dispatcher central no Raw SIS Socket (MÉDIA-F2) e separação `received_cpdus` (MÉDIA-B2).
+1. **Validação cruzada:** confrontar os vetores de wire (D_PDU, EOW, S_PDU) com outro stack 5066 conformante em teste de interoperabilidade real, como passo final de homologação. As figuras da norma já foram todas consultadas durante as Sprints 3 e 7.
+2. **Higiene de repositório:** decidir o destino de `src/interface/` (GUIs de demonstração ainda não rastreadas) e mergear a linha de sprints para `main`.
 
 ---
 
@@ -292,5 +320,6 @@ Trabalho contínuo opcional:
 - `docs/STANAG_5066_v3_ANEXO_C.md` — 5627 linhas (DTS).
 - `docs/STANAG_5066_v3_ANEXO_F.md` — 3101 linhas (Clientes).
 - Vetores oficiais de teste: Code Examples C-1, C-2 e Warning DPDU sample.
-- Suíte de regressão por sprint: `tests/test_sprint{1..5}_*_fixes.py` (117 casos novos).
+- Figuras da norma consultadas na Sprint 7: Fig A-3 (`images_anexo_A/media/image7.png`), Fig A-29 (`image33.png`), Fig C-37 (`images_anexo_C/media/image41.png`), Fig C-38 (`image42.png`).
+- Suíte de regressão por sprint: `tests/test_sprint{1..5,7}_*_fixes.py` + `tests/test_media_{f2_dispatcher,b2_received_cpdus}.py` (152 casos novos).
 - Suíte herdada: 450 testes anteriores à auditoria, mantidos sem regressão.

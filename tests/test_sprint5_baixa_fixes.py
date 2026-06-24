@@ -328,9 +328,11 @@ class TestRawSisHardLinkEstablishedUsesNegotiatedPriority:
             asyncio.set_event_loop(loop)
             node = _make_node()
             node.bind(5, rank=0)
-            # Configura sessão com prioridade negociada = 2, type = 1.
+            # Configura sessão com prioridade negociada = 2, type = 1 e o SAP
+            # iniciador (A.2.1.12 §2) que o dispatcher usa para rotear.
             node._link_session.link_priority = 2
             node._link_session.sis_hard_link_type = 1
+            node._link_session.local_initiator_sap = 5
 
             server = RawSisSocketServer(node)
 
@@ -347,8 +349,8 @@ class TestRawSisHardLinkEstablishedUsesNegotiatedPriority:
             server._connections[1] = conn
             server._sap_to_conn[5] = conn.conn_id  # mapeia sap_id -> conn_id
 
-            # Simula o callback registrado pelo server.
-            server._install_hard_link_callbacks(conn)
+            # Registra o dispatcher central (MÉDIA-F2) que instala os callbacks.
+            server._dispatcher.install()
             cb = node._callbacks.hard_link_established
             assert cb is not None
             cb(99, 3)  # remote_addr, remote_sap

@@ -109,15 +109,15 @@ class ManagementEngine:
                          interleave_mode: Optional[int] = None) -> int:
         """Send a DRC REQUEST management message (EOW Type 1)."""
         eow = build_eow_drc(data_rate_code, long_interleave, interleave_mode)
-        msg_type = eow & 0x0F
-        msg_contents = (eow >> 4) & 0xFF
+        msg_type = (eow >> 8) & 0x0F
+        msg_contents = eow & 0xFF
         return self.send(msg_type, msg_contents)
 
     def send_drc_response(self, response: int, reason: int = 0) -> int:
         """Send a DRC RESPONSE management message (EOW Type 2)."""
         eow = build_eow_drc_response(response, reason)
-        msg_type = eow & 0x0F
-        msg_contents = (eow >> 4) & 0xFF
+        msg_type = (eow >> 8) & 0x0F
+        msg_contents = eow & 0xFF
         return self.send(msg_type, msg_contents)
 
     @property

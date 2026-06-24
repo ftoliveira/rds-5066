@@ -10,11 +10,26 @@ from src.s_primitive_codec import (
 from src.stypes import SPrimitiveType
 
 
+class _FakeLinkSession:
+    """Sessão de enlace mínima para o dispatcher rotear eventos de hard link.
+
+    ``local_initiator_sap`` identifica o SAP local que iniciou o hard link
+    (A.2.1.12 §2) — o roteamento de established/rejected usa esse campo.
+    Default 0 casa com os testes que dão bind em SAP 0.
+    """
+
+    def __init__(self, local_initiator_sap=0):
+        self.local_initiator_sap = local_initiator_sap
+        self.sis_hard_link_type = 0
+        self.link_priority = 0
+
+
 def _make_mock_node(prebound_saps=None):
     """Build a mock StanagNode with realistic _callbacks and _saps attributes."""
     node = MagicMock()
     node.bind.return_value = 0
     node._saps = dict(prebound_saps) if prebound_saps else {}
+    node._link_session = _FakeLinkSession()
     callbacks = MagicMock()
     callbacks.unidata_indication = None
     node._callbacks = callbacks
@@ -107,7 +122,12 @@ async def test_hard_link_established_sends_primitive_to_client(mock_node):
 
 @pytest.mark.asyncio
 async def test_hard_link_terminated_sends_primitive_to_client(mock_node):
-    """When node fires hard_link_terminated callback, client receives S_HARD_LINK_TERMINATED."""
+    """When node fires hard_link_terminated_per_sap, the SAP owner gets S_HARD_LINK_TERMINATED.
+
+    A.3.2.2.3 §3: o dispatcher central roteia a terminação pelo callback
+    *per_sap* (que carrega o SAP afetado), não pelo callback global — este
+    não tem SAP e apenas encadeia ao host.
+    """
     server = RawSisSocketServer(mock_node, host='127.0.0.1', port=15703)
     await server.start()
     try:
@@ -119,15 +139,16 @@ async def test_hard_link_terminated_sends_primitive_to_client(mock_node):
         # Drain S_BIND_ACCEPTED
         await asyncio.wait_for(reader.read(64), timeout=0.5)
 
-        # Get the registered callback from mock_node.register_callbacks
+        # Get the registered per-sap callback from mock_node.register_callbacks
         hl_terminated_cb = None
         for call in mock_node.register_callbacks.call_args_list:
-            if 'hard_link_terminated' in call.kwargs:
-                hl_terminated_cb = call.kwargs['hard_link_terminated']
-        assert hl_terminated_cb is not None, "hard_link_terminated callback not registered"
+            if 'hard_link_terminated_per_sap' in call.kwargs:
+                hl_terminated_cb = call.kwargs['hard_link_terminated_per_sap']
+        assert hl_terminated_cb is not None, \
+            "hard_link_terminated_per_sap callback not registered"
 
-        # Fire the callback as the node would (signature: remote_addr, initiator_received_confirm)
-        hl_terminated_cb(0x456, False)  # remote_addr=0x456, initiator_received_confirm=False
+        # Fire as the node would: (sap_id, remote_addr, initiator_received_confirm)
+        hl_terminated_cb(0, 0x456, False)
 
         # Read response from server
         data = await asyncio.wait_for(reader.read(64), timeout=0.5)

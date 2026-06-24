@@ -1,8 +1,10 @@
 """EOW (Engineering Orderwire) message parser/builder per STANAG 5066 Edition 3 Annex C.5.
 
-The 12-bit EOW field is present in every D_PDU common header.  The lower
-4 bits define the *message type* and the upper 8 bits carry the *message
-content* whose meaning depends on the type:
+The 12-bit EOW field is present in every D_PDU common header.  Per Figure
+C-37 (and the normative text of C.5 §2: "the first 4 bits of the EOW shall
+contain the EOW-type field"), the *upper* 4 bits (bits 11-8) define the
+*message type* and the *lower* 8 bits (bits 7-0) carry the *message content*
+whose meaning depends on the type:
 
     Type 0 — Capability advertising (bitmap, Table C-4)
     Type 1 — Data Rate Change (DRC) Request: rate(4) | interleave(2) | other(2)
@@ -149,8 +151,8 @@ class DRCParams:
 class EOWMessage:
     """Parsed EOW message from the D_PDU common header."""
 
-    msg_type: int       # lower 4 bits
-    msg_content: int    # upper 8 bits
+    msg_type: int       # upper 4 bits (11-8)
+    msg_content: int    # lower 8 bits (7-0)
     drc_request: Optional[DRCRequestParams] = None
     drc_response: Optional[DRCResponseParams] = None
     unrecognized_type: Optional[int] = None
@@ -164,9 +166,13 @@ class EOWMessage:
 # ---------------------------------------------------------------------------
 
 def parse_eow(eow: int) -> EOWMessage:
-    """Parse the 12-bit EOW field into a typed message."""
-    msg_type = eow & 0x00F
-    msg_content = (eow >> 4) & 0x0FF
+    """Parse the 12-bit EOW field into a typed message.
+
+    Per Figure C-37: TYPE occupies bits 11-8 (upper 4 bits), the
+    type-specific content occupies bits 7-0 (lower 8 bits).
+    """
+    msg_type = (eow >> 8) & 0x00F
+    msg_content = eow & 0x0FF
 
     drc_request: Optional[DRCRequestParams] = None
     drc_response: Optional[DRCResponseParams] = None
@@ -223,7 +229,7 @@ def build_eow_drc(data_rate_code: int, long_interleave: bool = False,
     if interleave_mode is None:
         interleave_mode = InterleaveMode.LONG if long_interleave else InterleaveMode.SHORT
     content = ((data_rate_code & 0x0F) << 4) | ((interleave_mode & 0x03) << 2)
-    return (content << 4) | EOWType.DRC_REQUEST
+    return (int(EOWType.DRC_REQUEST) << 8) | content
 
 
 def build_eow_drc_response(response: int, reason: int = 0) -> int:
@@ -233,23 +239,23 @@ def build_eow_drc_response(response: int, reason: int = 0) -> int:
     reason: DRCRefuseReason (5 bits)
     """
     content = ((response & 0x07) << 5) | (reason & 0x1F)
-    return (content << 4) | EOWType.DRC_RESPONSE
+    return (int(EOWType.DRC_RESPONSE) << 8) | content
 
 
 def build_eow_unrecognized(unrecognized_type: int) -> int:
     """Build a 12-bit EOW field for Unrecognized Type Error (Type 3)."""
     content = unrecognized_type & 0x0F
-    return (content << 4) | EOWType.UNRECOGNIZED_TYPE
+    return (int(EOWType.UNRECOGNIZED_TYPE) << 8) | content
 
 
 def build_eow_capability(bitmap: int) -> int:
     """Build a 12-bit EOW field for Capability Advertisement (Type 4)."""
-    return ((bitmap & 0xFF) << 4) | EOWType.CAPABILITY_ADVERTISEMENT
+    return (int(EOWType.CAPABILITY_ADVERTISEMENT) << 8) | (bitmap & 0xFF)
 
 
 def build_eow_version(version: int = 0) -> int:
     """Build a 12-bit EOW for version (uses Type 3 slot — legacy compat)."""
-    return ((version & 0xFF) << 4) | EOWType.UNRECOGNIZED_TYPE
+    return (int(EOWType.UNRECOGNIZED_TYPE) << 8) | (version & 0xFF)
 
 
 # ---------------------------------------------------------------------------

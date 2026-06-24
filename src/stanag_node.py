@@ -214,7 +214,11 @@ class StanagNode:
         self._mgmt_engine: ManagementEngine | None = None
 
         # --- DTS internal state ---
-        self.received_cpdus: list = []
+        # MÉDIA-B2: listas separadas por semântica (a antiga ``received_cpdus``
+        # misturava as duas). DATA C_PDUs (ARQ/Expedited) são consumidos por
+        # ``_process_rx``; C_PDUs de controle (Non-ARQ) são apenas arquivados.
+        self.received_data_cpdus: list = []
+        self.received_control_cpdus: list = []
         self.received_deliveries: list[NonArqDelivery] = []
 
         # --- SIS internal state ---
@@ -249,6 +253,16 @@ class StanagNode:
 
         # Start modem RX
         modem.modem_rx_start()
+
+    @property
+    def received_cpdus(self) -> list:
+        """Visão somente-leitura combinada (compat MÉDIA-B2, *deprecated*).
+
+        Antes da Sprint 6 esta era uma única lista com semântica mista. Agora
+        é derivada de ``received_data_cpdus`` + ``received_control_cpdus``. Use
+        as listas específicas; este alias existe só para introspecção externa.
+        """
+        return self.received_data_cpdus + self.received_control_cpdus
 
     # -------------------------------------------------------------------
     # SIS: Configuração de Rank (A.2.1.1 / A.3.2.2.1)
@@ -730,7 +744,7 @@ class StanagNode:
         )
         self.cas.process_cpdu(cpdu, delivery.source, self._current_time_ms)
         if cpdu.cpdu_type is not CPDUType.DATA:
-            self.received_cpdus.append(cpdu)
+            self.received_control_cpdus.append(cpdu)
 
     def _on_arq_delivery(self, payload: bytes) -> None:
         if self.cas.remote_node_address is None:
@@ -743,7 +757,7 @@ class StanagNode:
         if cpdu.cpdu_type != CPDUType.DATA:
             return
         flow_rx("DTS", f"node={self.local_node_address} ARQ DATA len={len(payload)} remote={self.cas.remote_node_address}")
-        self.received_cpdus.append(cpdu)
+        self.received_data_cpdus.append(cpdu)
 
     def _on_expedited_delivery(self, payload: bytes) -> None:
         if self.cas.remote_node_address is None:
@@ -756,7 +770,7 @@ class StanagNode:
         if cpdu.cpdu_type != CPDUType.DATA:
             return
         flow_rx("DTS", f"node={self.local_node_address} EXPEDITED DATA len={len(payload)} remote={self.cas.remote_node_address}")
-        self.received_cpdus.append(cpdu)
+        self.received_data_cpdus.append(cpdu)
 
     def _dispatch_rx_frame(self, frame: bytes) -> None:
         try:
@@ -956,7 +970,7 @@ class StanagNode:
 
     def _process_rx(self) -> None:
         """Processa CPDUs recebidas (ARQ DATA) — contêm S_PDU codificado."""
-        cpdus = self.received_cpdus
+        cpdus = self.received_data_cpdus
         while self._rx_cursor < len(cpdus):
             cpdu = cpdus[self._rx_cursor]
             self._rx_cursor += 1
@@ -1161,8 +1175,10 @@ class StanagNode:
     def _terminate_existing_hard_link(self, reason: int) -> None:
         """A.3.2.2.2 §8: encerra o Hard Link prévio antes de aceitar novo.
 
-        Envia TERMINATE ao peer corrente, dispara callback ``hard_link_terminated``
-        ao owner local com o reason indicado e zera o estado da sessão.
+        Envia TERMINATE ao peer corrente, notifica os SAPs afetados via
+        ``hard_link_terminated_per_sap`` (A.3.2.2.3 §3 — clientes socket
+        recebem S_HARD_LINK_TERMINATED), dispara o callback global
+        ``hard_link_terminated`` e zera o estado da sessão.
         """
         prev_remote_addr = self._link_session.remote_addr
         prev_owner = self._link_session.hard_link_owner
@@ -1171,6 +1187,11 @@ class StanagNode:
                 prev_remote_addr,
                 encode_spdu_hard_link_terminate(reason),
             )
+        # A.3.2.2.3 §3: notifica os SAPs afetados (clientes socket recebem
+        # S_HARD_LINK_TERMINATED) ANTES do reset zerar tipo/owner/initiator.
+        self._notify_hard_link_terminated_per_sap(
+            prev_remote_addr, initiator_received_confirm=False,
+        )
         self._reset_link_session_to_idle()
         if self._callbacks.hard_link_terminated is not None:
             self._callbacks.hard_link_terminated(

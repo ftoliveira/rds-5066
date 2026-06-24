@@ -134,18 +134,18 @@ class TestServiceType:
             assert d['min_retransmissions'] == mr
 
     def test_bit_layout(self):
-        # transmission_mode=2 -> bits 15:14 = 10
-        # delivery_confirmation=1 -> bits 13:12 = 01
-        # delivery_order=True -> bit 11 = 1
-        # extended=False -> bit 10 = 0
-        # min_retransmissions=5 -> bits 9:6 = 0101
+        # Fig A-3 layout (identical to Fig A-29):
+        #   Byte 0: TX_MODE[7:4]=0010, CONFIRM[3:2]=01, ORDER[1]=1, EXT[0]=0
+        #   Byte 1: MIN. No OF RETXS[7:4]=0101
         encoded = encode_service_type(2, 1, True, False, 5)
-        val = struct.unpack('>H', encoded)[0]
-        assert (val >> 14) & 0x03 == 2
-        assert (val >> 12) & 0x03 == 1
-        assert (val >> 11) & 0x01 == 1
-        assert (val >> 10) & 0x01 == 0
-        assert (val >> 6) & 0x0F == 5
+        assert len(encoded) == 2
+        byte0, byte1 = encoded[0], encoded[1]
+        assert (byte0 >> 4) & 0x0F == 2     # transmission mode (4 bits)
+        assert (byte0 >> 2) & 0x03 == 1     # delivery confirmation
+        assert (byte0 >> 1) & 0x01 == 1     # delivery order
+        assert byte0 & 0x01 == 0            # extended field
+        assert (byte1 >> 4) & 0x0F == 5     # min retransmissions
+        assert encoded == bytes([0x26, 0x50])
 
 
 # -----------------------------------------------------------------------

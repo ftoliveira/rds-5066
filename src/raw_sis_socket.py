@@ -64,6 +64,201 @@ class _ClientConnection:
         self.last_keep_alive_sent_ms: float = 0.0
 
 
+class AnnexFDispatcher:
+    """Roteador central de indicações SIS → conexões TCP (F.16 / MÉDIA-F2).
+
+    Substitui a antiga cadeia de callbacks instalada *por bind*, que tinha
+    dois defeitos:
+
+      * ``unidata_indication`` era reembrulhada a cada bind, formando uma
+        cadeia de closures que crescia indefinidamente e nunca era desfeita
+        no unbind/disconnect — vazando referências a conexões mortas;
+      * os quatro callbacks de hard link eram **sobrescritos** a cada bind:
+        apenas o último cliente recebia eventos e os callbacks do host eram
+        perdidos.
+
+    O dispatcher é registrado **uma única vez** no nó (idempotente). O
+    roteamento consulta a tabela viva ``server._sap_to_conn``; quando um SAP
+    não pertence a nenhuma conexão socket, a indicação é delegada ao callback
+    de host capturado no momento da instalação. Adicionar/remover clientes
+    passa a ser apenas atualizar ``_sap_to_conn`` — sem (des)instalar nada.
+
+    Roteamento por evento:
+      * ``unidata_indication``        → SAP destino (``indication.dest_sap``);
+      * ``hard_link_established``     → SAP iniciador (``_link_session
+        .local_initiator_sap``, A.2.1.12 §2);
+      * ``hard_link_rejected``        → idem (só o caller aguarda resposta);
+      * ``hard_link_indication``      → SAP local destino (2º argumento);
+      * ``hard_link_terminated_per_sap`` → SAP afetado (A.3.2.2.3 §3);
+      * ``hard_link_terminated`` (global, sem SAP) → apenas encadeia ao host;
+        clientes socket são notificados pela variante *per_sap*.
+    """
+
+    __slots__ = (
+        '_server', '_installed',
+        '_host_unidata', '_host_hl_established', '_host_hl_rejected',
+        '_host_hl_indication', '_host_hl_terminated',
+        '_host_hl_terminated_per_sap',
+    )
+
+    def __init__(self, server: RawSisSocketServer):
+        self._server = server
+        self._installed = False
+        self._host_unidata = None
+        self._host_hl_established = None
+        self._host_hl_rejected = None
+        self._host_hl_indication = None
+        self._host_hl_terminated = None
+        self._host_hl_terminated_per_sap = None
+
+    def install(self) -> None:
+        """Registra o dispatcher no nó (idempotente).
+
+        Captura os callbacks de host pré-existentes como fallback para SAPs
+        que não pertençam a nenhuma conexão socket.
+        """
+        if self._installed:
+            return
+        cb = self._server.node._callbacks
+        self._host_unidata = cb.unidata_indication
+        self._host_hl_established = cb.hard_link_established
+        self._host_hl_rejected = cb.hard_link_rejected
+        self._host_hl_indication = cb.hard_link_indication
+        self._host_hl_terminated = cb.hard_link_terminated
+        self._host_hl_terminated_per_sap = cb.hard_link_terminated_per_sap
+        self._server.node.register_callbacks(
+            unidata_indication=self._on_unidata,
+            hard_link_established=self._on_hard_link_established,
+            hard_link_rejected=self._on_hard_link_rejected,
+            hard_link_indication=self._on_hard_link_indication,
+            hard_link_terminated=self._on_hard_link_terminated,
+            hard_link_terminated_per_sap=self._on_hard_link_terminated_per_sap,
+        )
+        self._installed = True
+
+    # ------------------------------------------------------------------
+    # Resolução de destino
+    # ------------------------------------------------------------------
+
+    def _conn_for_sap(self, sap_id) -> _ClientConnection | None:
+        """Conexão TCP viva dona de ``sap_id``, ou None."""
+        if sap_id is None or sap_id < 0:
+            return None
+        conn_id = self._server._sap_to_conn.get(sap_id)
+        if conn_id is None:
+            return None
+        conn = self._server._connections.get(conn_id)
+        if conn is None or conn.writer.is_closing():
+            return None
+        return conn
+
+    def _initiator_sap(self) -> int:
+        """SAP local que iniciou o hard link corrente (A.2.1.12 §2)."""
+        session = getattr(self._server.node, '_link_session', None)
+        if session is None:
+            return -1
+        try:
+            return int(getattr(session, 'local_initiator_sap', -1))
+        except (TypeError, ValueError):
+            return -1
+
+    # ------------------------------------------------------------------
+    # Handlers registrados no nó
+    # ------------------------------------------------------------------
+
+    def _on_unidata(self, indication: SisUnidataIndication):
+        conn = self._conn_for_sap(indication.dest_sap)
+        if conn is None:
+            if self._host_unidata is not None:
+                self._host_unidata(indication)
+            return
+        self._server._send_raw(conn, encode_unidata_indication(
+            priority=indication.priority,
+            dest_sap=indication.dest_sap,
+            dest_addr=0,  # nó local
+            tx_mode=TxMode.ARQ,
+            src_sap=indication.src_sap,
+            src_addr=indication.src_addr,
+            updu=indication.updu,
+        ))
+
+    def _on_hard_link_established(self, remote_addr, remote_sap):
+        conn = self._conn_for_sap(self._initiator_sap())
+        if conn is None:
+            if self._host_hl_established is not None:
+                self._host_hl_established(remote_addr, remote_sap)
+            return
+        # Lê link_type/link_priority realmente negociados em ``_link_session``
+        # (MÉDIA-F3); 0 é default seguro para os nibbles do S_PDU tipo 3.
+        session = getattr(self._server.node, '_link_session', None)
+        link_type = (
+            int(getattr(session, 'sis_hard_link_type', 0)) & 0x03
+            if session is not None else 0
+        )
+        link_priority = (
+            int(getattr(session, 'link_priority', 0)) & 0x03
+            if session is not None else 0
+        )
+        self._server._send_raw(conn, encode_hard_link_established(
+            remote_node_status=0,
+            link_type=link_type,
+            link_priority=link_priority,
+            remote_sap=remote_sap,
+            remote_node=remote_addr,
+        ))
+
+    def _on_hard_link_rejected(self, remote_addr, remote_sap, reason):
+        conn = self._conn_for_sap(self._initiator_sap())
+        if conn is None:
+            if self._host_hl_rejected is not None:
+                self._host_hl_rejected(remote_addr, remote_sap, reason)
+            return
+        self._server._send_raw(conn, encode_hard_link_rejected(
+            reason=reason,
+            link_type=0,
+            link_priority=0,
+            remote_sap=remote_sap,
+            remote_node=remote_addr,
+        ))
+
+    def _on_hard_link_indication(self, remote_addr, local_sap, link_priority, link_type):
+        # A 2ª posição carrega o SAP local destino do pedido (deve estar bound).
+        conn = self._conn_for_sap(local_sap)
+        if conn is None:
+            if self._host_hl_indication is not None:
+                self._host_hl_indication(remote_addr, local_sap, link_priority, link_type)
+            return
+        self._server._send_raw(conn, encode_hard_link_indication(
+            remote_node_status=0,
+            link_type=link_type,
+            link_priority=link_priority,
+            remote_sap=local_sap,
+            remote_node=remote_addr,
+        ))
+
+    def _on_hard_link_terminated_per_sap(self, sap_id, remote_addr, initiator_received_confirm):
+        # A.3.2.2.3 §3: callback granular carrega o SAP afetado → roteamento exato.
+        conn = self._conn_for_sap(sap_id)
+        if conn is None:
+            if self._host_hl_terminated_per_sap is not None:
+                self._host_hl_terminated_per_sap(
+                    sap_id, remote_addr, initiator_received_confirm)
+            return
+        self._server._send_raw(conn, encode_hard_link_terminated(
+            reason=0,
+            link_type=0,
+            link_priority=0,
+            remote_sap=0,
+            remote_node=remote_addr,
+        ))
+
+    def _on_hard_link_terminated(self, remote_addr, initiator_received_confirm):
+        # O callback global não carrega SAP: clientes socket são notificados via
+        # _on_hard_link_terminated_per_sap. Aqui só encadeamos ao host.
+        if self._host_hl_terminated is not None:
+            self._host_hl_terminated(remote_addr, initiator_received_confirm)
+
+
 class RawSisSocketServer:
     """TCP server que expoe a interface SIS via socket (F.16)."""
 
@@ -77,6 +272,9 @@ class RawSisSocketServer:
         self._connections: dict[int, _ClientConnection] = {}
         self._conn_counter = 0
         self._sap_to_conn: dict[int, int] = {}  # sap_id -> conn_id
+        # Roteador central de indicações SIS → conexões TCP (MÉDIA-F2).
+        # Registrado no nó no primeiro bind; roteia por ``_sap_to_conn``.
+        self._dispatcher = AnnexFDispatcher(self)
 
     async def start(self):
         """Inicia o server socket assincrono."""
@@ -216,9 +414,9 @@ class RawSisSocketServer:
             conn.rank = req['rank']
             self._sap_to_conn[sap_id] = conn.conn_id
 
-            # Install callback for this SAP
-            self._install_sap_callback(conn)
-            self._install_hard_link_callbacks(conn)
+            # Roteador central registrado uma única vez; roteia indicações
+            # deste e dos demais SAPs via ``_sap_to_conn`` (MÉDIA-F2).
+            self._dispatcher.install()
 
             mtu = 2048  # default MTU
             self._send_raw(conn, encode_bind_accepted(sap_id, mtu))
@@ -338,104 +536,6 @@ class RawSisSocketServer:
         req = decode_management_msg_request(payload)
         logger.debug("Client %d: management msg: %d bytes",
                      conn.conn_id, len(req['message']))
-
-    def _install_sap_callback(self, conn: _ClientConnection):
-        """Instala callback SIS para despachar indicacoes ao cliente TCP."""
-        sap_id = conn.bound_sap
-        conn_id = conn.conn_id
-
-        original_unidata = self.node._callbacks.unidata_indication
-
-        def on_unidata(indication: SisUnidataIndication):
-            # If this indication is for our SAP, send to TCP client
-            if indication.dest_sap == sap_id:
-                target_conn = self._connections.get(conn_id)
-                if target_conn and not target_conn.writer.is_closing():
-                    encoded = encode_unidata_indication(
-                        priority=indication.priority,
-                        dest_sap=indication.dest_sap,
-                        dest_addr=0,  # local node
-                        tx_mode=TxMode.ARQ,
-                        src_sap=indication.src_sap,
-                        src_addr=indication.src_addr,
-                        updu=indication.updu,
-                    )
-                    self._send_raw(target_conn, encoded)
-                return
-            # Pass to original handler if not ours
-            if original_unidata:
-                original_unidata(indication)
-
-        self.node.register_callbacks(unidata_indication=on_unidata)
-
-    def _install_hard_link_callbacks(self, conn: _ClientConnection):
-        """Instala callbacks de hard link para enviar S_PRIMITIVEs ao cliente TCP."""
-        sap_id = conn.bound_sap
-        conn_id = conn.conn_id
-
-        def _send_to_conn(data):
-            target = self._connections.get(conn_id)
-            if target and not target.writer.is_closing():
-                self._send_raw(target, data)
-
-        def on_established(remote_addr, remote_sap):
-            if self._sap_to_conn.get(sap_id) == conn_id:
-                # Lê os valores realmente negociados em ``_link_session``;
-                # se a sessão estiver entre transições, usa 0 (default seguro
-                # para nibbles do S_PDU tipo 3).
-                session = getattr(self.node, "_link_session", None)
-                link_type = (
-                    int(getattr(session, "sis_hard_link_type", 0)) & 0x03
-                    if session is not None else 0
-                )
-                link_priority = (
-                    int(getattr(session, "link_priority", 0)) & 0x03
-                    if session is not None else 0
-                )
-                _send_to_conn(encode_hard_link_established(
-                    remote_node_status=0,
-                    link_type=link_type,
-                    link_priority=link_priority,
-                    remote_sap=remote_sap,
-                    remote_node=remote_addr,
-                ))
-
-        def on_rejected(remote_addr, remote_sap, reason):
-            if self._sap_to_conn.get(sap_id) == conn_id:
-                _send_to_conn(encode_hard_link_rejected(
-                    reason=reason,
-                    link_type=0,
-                    link_priority=0,
-                    remote_sap=remote_sap,
-                    remote_node=remote_addr,
-                ))
-
-        def on_terminated(remote_addr, _initiator_received_confirm):
-            if self._sap_to_conn.get(sap_id) == conn_id:
-                _send_to_conn(encode_hard_link_terminated(
-                    reason=0,
-                    link_type=0,
-                    link_priority=0,
-                    remote_sap=0,
-                    remote_node=remote_addr,
-                ))
-
-        def on_indication(remote_addr, remote_sap, link_priority, link_type):
-            if self._sap_to_conn.get(sap_id) == conn_id:
-                _send_to_conn(encode_hard_link_indication(
-                    remote_node_status=0,
-                    link_type=link_type,
-                    link_priority=link_priority,
-                    remote_sap=remote_sap,
-                    remote_node=remote_addr,
-                ))
-
-        self.node.register_callbacks(
-            hard_link_established=on_established,
-            hard_link_rejected=on_rejected,
-            hard_link_terminated=on_terminated,
-            hard_link_indication=on_indication,
-        )
 
     def send_to_client(self, sap_id: int, prim_type: int, payload: bytes):
         """Envia S_PRIMITIVE codificada a um cliente via SAP ID."""

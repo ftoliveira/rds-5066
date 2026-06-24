@@ -212,11 +212,13 @@ class ManagementHeader:
 
     @property
     def msg_type(self) -> int:
-        return self.message_field & 0x0F
+        # Fig C-37: EOW TYPE = bits 11-8 (upper 4 bits) of the 12-bit field.
+        return (self.message_field >> 8) & 0x0F
 
     @property
     def message_contents(self) -> int:
-        return (self.message_field >> 4) & 0xFF
+        # Fig C-37: content = bits 7-0 (lower 8 bits) of the 12-bit field.
+        return self.message_field & 0xFF
 
 
 @dataclass(slots=True)
