@@ -214,7 +214,11 @@ class StanagNode:
         self._mgmt_engine: ManagementEngine | None = None
 
         # --- DTS internal state ---
-        self.received_cpdus: list = []
+        # MÉDIA-B2: listas separadas por semântica (a antiga ``received_cpdus``
+        # misturava as duas). DATA C_PDUs (ARQ/Expedited) são consumidos por
+        # ``_process_rx``; C_PDUs de controle (Non-ARQ) são apenas arquivados.
+        self.received_data_cpdus: list = []
+        self.received_control_cpdus: list = []
         self.received_deliveries: list[NonArqDelivery] = []
 
         # --- SIS internal state ---
@@ -249,6 +253,16 @@ class StanagNode:
 
         # Start modem RX
         modem.modem_rx_start()
+
+    @property
+    def received_cpdus(self) -> list:
+        """Visão somente-leitura combinada (compat MÉDIA-B2, *deprecated*).
+
+        Antes da Sprint 6 esta era uma única lista com semântica mista. Agora
+        é derivada de ``received_data_cpdus`` + ``received_control_cpdus``. Use
+        as listas específicas; este alias existe só para introspecção externa.
+        """
+        return self.received_data_cpdus + self.received_control_cpdus
 
     # -------------------------------------------------------------------
     # SIS: Configuração de Rank (A.2.1.1 / A.3.2.2.1)
@@ -730,7 +744,7 @@ class StanagNode:
         )
         self.cas.process_cpdu(cpdu, delivery.source, self._current_time_ms)
         if cpdu.cpdu_type is not CPDUType.DATA:
-            self.received_cpdus.append(cpdu)
+            self.received_control_cpdus.append(cpdu)
 
     def _on_arq_delivery(self, payload: bytes) -> None:
         if self.cas.remote_node_address is None:
@@ -743,7 +757,7 @@ class StanagNode:
         if cpdu.cpdu_type != CPDUType.DATA:
             return
         flow_rx("DTS", f"node={self.local_node_address} ARQ DATA len={len(payload)} remote={self.cas.remote_node_address}")
-        self.received_cpdus.append(cpdu)
+        self.received_data_cpdus.append(cpdu)
 
     def _on_expedited_delivery(self, payload: bytes) -> None:
         if self.cas.remote_node_address is None:
@@ -756,7 +770,7 @@ class StanagNode:
         if cpdu.cpdu_type != CPDUType.DATA:
             return
         flow_rx("DTS", f"node={self.local_node_address} EXPEDITED DATA len={len(payload)} remote={self.cas.remote_node_address}")
-        self.received_cpdus.append(cpdu)
+        self.received_data_cpdus.append(cpdu)
 
     def _dispatch_rx_frame(self, frame: bytes) -> None:
         try:
@@ -956,7 +970,7 @@ class StanagNode:
 
     def _process_rx(self) -> None:
         """Processa CPDUs recebidas (ARQ DATA) — contêm S_PDU codificado."""
-        cpdus = self.received_cpdus
+        cpdus = self.received_data_cpdus
         while self._rx_cursor < len(cpdus):
             cpdu = cpdus[self._rx_cursor]
             self._rx_cursor += 1
