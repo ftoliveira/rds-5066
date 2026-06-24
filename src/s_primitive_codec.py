@@ -86,63 +86,85 @@ def decode_address(data: bytes, offset: int = 0) -> tuple[int, int, bool]:
 
 
 # ---------------------------------------------------------------------------
-# Delivery Mode encoding (A.2.2.28.2): 1 byte
-#   Bits [7:4] = tx_mode (4 bits)
-#   Bits [3:2] = delivery_confirm (2 bits)
-#   Bit  [1]   = delivery_order
-#   Bit  [0]   = extension
+# Delivery Mode encoding (A.2.2.28.2, Fig A-29)
+#   Byte 0: Bits [7:4] = tx_mode (4 bits)
+#           Bits [3:2] = delivery_confirm (2 bits)
+#           Bit  [1]   = delivery_order
+#           Bit  [0]   = extension
+#   Byte 1 (optional): Bits [7:4] = MIN. No OF RETXS (only meaningful for a
+#           Non-ARQ subtype; "don't care" otherwise — Fig A-29).
+# The S_UNIDATA_REQUEST framing transmits only byte 0; the optional retx byte
+# is supported here for completeness and is emitted only when requested.
 # ---------------------------------------------------------------------------
 
 def encode_delivery_mode(tx_mode: int, delivery_confirm: int = 0,
-                         delivery_order: bool = False, ext: bool = False) -> bytes:
-    """Encode delivery mode as 1 byte (A.2.2.28.2)."""
-    val = ((tx_mode & 0x0F) << 4) | ((delivery_confirm & 0x03) << 2) | \
-          (int(delivery_order) << 1) | int(ext)
-    return bytes([val])
+                         delivery_order: bool = False, ext: bool = False,
+                         min_retransmissions: int | None = None) -> bytes:
+    """Encode delivery mode per Fig A-29.
+
+    Returns 1 byte normally. When ``min_retransmissions`` is given (Non-ARQ
+    subtypes), appends the optional second byte with MIN. No OF RETXS in
+    bits [7:4].
+    """
+    byte0 = ((tx_mode & 0x0F) << 4) | ((delivery_confirm & 0x03) << 2) | \
+            (int(delivery_order) << 1) | int(ext)
+    if min_retransmissions is None:
+        return bytes([byte0])
+    return bytes([byte0, (min_retransmissions & 0x0F) << 4])
 
 
-def decode_delivery_mode(data: bytes, offset: int = 0) -> dict:
-    """Decode 1-byte delivery mode. Returns dict with tx_mode, delivery_confirm, etc."""
+def decode_delivery_mode(data: bytes, offset: int = 0, *,
+                         with_min_retx: bool = False) -> dict:
+    """Decode delivery mode byte(s) per Fig A-29.
+
+    Reads 1 byte by default. With ``with_min_retx=True`` also reads the
+    optional second byte (MIN. No OF RETXS in bits [7:4]).
+    """
     val = data[offset]
-    return {
+    result = {
         'tx_mode': (val >> 4) & 0x0F,
         'delivery_confirm': (val >> 2) & 0x03,
         'delivery_order': bool((val >> 1) & 0x01),
         'extension': bool(val & 0x01),
     }
+    if with_min_retx:
+        result['min_retransmissions'] = (data[offset + 1] >> 4) & 0x0F
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Service Type encoding (Fig A-3): 2 bytes (16 bits)
-#   Bits [15:14] = Transmission Mode
-#   Bits [13:12] = Delivery Confirmation
-#   Bit  [11]    = Delivery Order
-#   Bit  [10]    = Extended Field
-#   Bits [9:6]   = Min Retransmissions
-#   Bits [5:0]   = Reserved (0)
+# Service Type encoding (Fig A-3): 2 bytes
+#   Byte 0: Bits [7:4] = Transmission Mode (4 bits)
+#           Bits [3:2] = Delivery Confirmation (2 bits)
+#           Bit  [1]   = Delivery Order
+#           Bit  [0]   = Extended Field
+#   Byte 1: Bits [7:4] = Min. No. of Retransmissions (Non-ARQ only)
+#           Bits [3:0] = don't care
+# Fig A-3 (SERVICE TYPE) is identical to Fig A-29 (DELIVERY MODE).
 # ---------------------------------------------------------------------------
 
 def encode_service_type(transmission_mode: int = 2, delivery_confirmation: int = 0,
                         delivery_order: bool = False, extended: bool = False,
                         min_retransmissions: int = 0) -> bytes:
-    """Encode SERVICE_TYPE as 2 bytes (Fig A-3)."""
-    val = ((transmission_mode & 0x03) << 14) | \
-          ((delivery_confirmation & 0x03) << 12) | \
-          (int(delivery_order) << 11) | \
-          (int(extended) << 10) | \
-          ((min_retransmissions & 0x0F) << 6)
-    return struct.pack('>H', val)
+    """Encode SERVICE_TYPE as 2 bytes per Fig A-3."""
+    byte0 = ((transmission_mode & 0x0F) << 4) | \
+            ((delivery_confirmation & 0x03) << 2) | \
+            (int(delivery_order) << 1) | \
+            int(extended)
+    byte1 = (min_retransmissions & 0x0F) << 4
+    return bytes([byte0, byte1])
 
 
 def decode_service_type(data: bytes, offset: int = 0) -> dict:
-    """Decode 2-byte SERVICE_TYPE. Returns dict with subfields."""
-    val = struct.unpack_from('>H', data, offset)[0]
+    """Decode 2-byte SERVICE_TYPE per Fig A-3. Returns dict with subfields."""
+    byte0 = data[offset]
+    byte1 = data[offset + 1]
     return {
-        'transmission_mode': (val >> 14) & 0x03,
-        'delivery_confirmation': (val >> 12) & 0x03,
-        'delivery_order': bool((val >> 11) & 0x01),
-        'extended': bool((val >> 10) & 0x01),
-        'min_retransmissions': (val >> 6) & 0x0F,
+        'transmission_mode': (byte0 >> 4) & 0x0F,
+        'delivery_confirmation': (byte0 >> 2) & 0x03,
+        'delivery_order': bool((byte0 >> 1) & 0x01),
+        'extended': bool(byte0 & 0x01),
+        'min_retransmissions': (byte1 >> 4) & 0x0F,
     }
 
 

@@ -695,7 +695,8 @@ def build_management(
 ) -> DPDU:
     if len(data) > 23:
         raise ValueError("Management extended message cannot exceed 23 bytes")
-    message_field = ((message_contents & 0xFF) << 4) | (msg_type & 0x0F)
+    # Fig C-37: TYPE = bits 11-8 (upper 4 bits), content = bits 7-0.
+    message_field = ((msg_type & 0x0F) << 8) | (message_contents & 0xFF)
     return DPDU(
         dpdu_type=DPDUType.MANAGEMENT,
         eow=message_field & 0xFFF,

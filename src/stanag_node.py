@@ -1175,8 +1175,10 @@ class StanagNode:
     def _terminate_existing_hard_link(self, reason: int) -> None:
         """A.3.2.2.2 §8: encerra o Hard Link prévio antes de aceitar novo.
 
-        Envia TERMINATE ao peer corrente, dispara callback ``hard_link_terminated``
-        ao owner local com o reason indicado e zera o estado da sessão.
+        Envia TERMINATE ao peer corrente, notifica os SAPs afetados via
+        ``hard_link_terminated_per_sap`` (A.3.2.2.3 §3 — clientes socket
+        recebem S_HARD_LINK_TERMINATED), dispara o callback global
+        ``hard_link_terminated`` e zera o estado da sessão.
         """
         prev_remote_addr = self._link_session.remote_addr
         prev_owner = self._link_session.hard_link_owner
@@ -1185,6 +1187,11 @@ class StanagNode:
                 prev_remote_addr,
                 encode_spdu_hard_link_terminate(reason),
             )
+        # A.3.2.2.3 §3: notifica os SAPs afetados (clientes socket recebem
+        # S_HARD_LINK_TERMINATED) ANTES do reset zerar tipo/owner/initiator.
+        self._notify_hard_link_terminated_per_sap(
+            prev_remote_addr, initiator_received_confirm=False,
+        )
         self._reset_link_session_to_idle()
         if self._callbacks.hard_link_terminated is not None:
             self._callbacks.hard_link_terminated(
