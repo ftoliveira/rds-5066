@@ -19,6 +19,8 @@ from typing import Any
 import numpy as np
 
 from src.flow_log import SYNC_BYTES, dpdu_wire_hint, flow_rx, flow_tx
+from src.modem.dpdu_framing import dpdu_wire_size as _dpdu_wire_size
+from src.modem.dpdu_framing import split_stream as _dpdu_split_stream_impl
 from src.modem_if import ModemConfig, ModemInterface
 
 
@@ -54,65 +56,14 @@ def _bits_to_dpdu_bytes(bits: "Any") -> bytes:
     return np.packbits(valid_bits).tobytes()
 
 
-# Nibbles de DPDUType que carregam payload de dados + CRC de dados.
-# DATA_ONLY=0, DATA_ACK=2, EXPEDITED_DATA_ONLY=4, NON_ARQ=7, EXPEDITED_NON_ARQ=8
-_DATA_CRC_NIBBLES: frozenset[int] = frozenset({0, 2, 4, 7, 8})
-
-
-def _dpdu_wire_size(stream: bytes, offset: int) -> int:
-    """Retorna o tamanho em bytes do D_PDU que começa em stream[offset].
-
-    Suporta todos os tipos definidos em STANAG 5066 Annex C.
-    Lança ValueError se o stream for curto ou o sync estiver ausente.
-    """
-    if len(stream) < offset + 8:
-        raise ValueError("Stream curto demais para conter um D_PDU")
-    if stream[offset:offset + 2] != SYNC_BYTES:
-        raise ValueError(f"Sync 0x90EB não encontrado em offset {offset}")
-    header_size = stream[offset + 5] & 0x1F
-    address_size = (stream[offset + 5] >> 5) & 0x07
-    # HDR_SIZE excludes address (v3 mandatory, C.3.2.5)
-    payload_rel = 2 + header_size + address_size + 2
-    dpdu_type_nibble = (stream[offset + 2] >> 4) & 0x0F
-    if dpdu_type_nibble in _DATA_CRC_NIBBLES:
-        ts_offset = offset + 6 + address_size         # type-specific header start (absoluto)
-        if len(stream) < ts_offset + 2:
-            raise ValueError("Stream curto para ler data_len")
-        first = stream[ts_offset]
-        second = stream[ts_offset + 1]
-        data_len = ((first & 0x03) << 8) | second
-        return payload_rel + data_len + 4             # tamanho relativo: dados + data_crc(4 bytes, CRC-32)
-    return payload_rel                                # sem payload de dados
-
-
 def _dpdu_split_stream(stream: bytes) -> list[bytes]:
-    """Divide um stream de bytes contendo D_PDUs concatenados em D_PDUs individuais.
+    """Divide um stream concatenado em D_PDUs individuais (helper compartilhado).
 
-    Percorre o stream de offset em offset usando _dpdu_wire_size para saber
-    onde cada D_PDU termina. Ignora bytes espúrios antes do próximo sync.
+    Delega para `src.modem.dpdu_framing.split_stream` (lógica única reusada por
+    HF/UDP/TCP). Mantém o log de fluxo histórico do caminho HF.
     """
-    result: list[bytes] = []
-    pos = 0
-    length = len(stream)
-    while pos < length:
-        # Procurar próximo sync 0x90EB
-        if stream[pos:pos + 2] != SYNC_BYTES:
-            next_sync = stream.find(SYNC_BYTES, pos + 1)
-            print("next_sync", next_sync)
-            if next_sync == -1:
-                break
-            pos = next_sync
-        try:
-            size = _dpdu_wire_size(stream, pos)
-        except ValueError:
-            # Sync falso ou stream corrompido — avançar 1 byte e tentar de novo
-            pos += 1
-            continue
-        if pos + size > length:
-            break
-        result.append(stream[pos:pos + size])
-        pos += size
-    print(f"------- [{_ts()}] [HFModem RX] Stream dividido em {len(result)} D_PDUs (total {length} bytes)")
+    result = _dpdu_split_stream_impl(stream)
+    print(f"------- [{_ts()}] [HFModem RX] Stream dividido em {len(result)} D_PDUs (total {len(stream)} bytes)")
     return result
 
 

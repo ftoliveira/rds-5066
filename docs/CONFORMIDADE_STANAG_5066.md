@@ -307,8 +307,8 @@ Restam apenas **5 itens BAIXA** que não impactam interop real entre nós confor
 A implementação atende **rigorosamente** os requisitos críticos da Edição 3 e está **pronta para testes de interoperabilidade** entre nós conformantes. Os 5 itens restantes são todos **BAIXA** de robustez secundária; nenhum bloqueia operação real ou interop com peers padrão. Todos os itens CRÍTICA, ALTA e MÉDIA foram tratados.
 
 Trabalho contínuo opcional:
-1. **Validação cruzada:** confrontar os vetores de wire (D_PDU, EOW, S_PDU) com outro stack 5066 conformante em teste de interoperabilidade real, como passo final de homologação. As figuras da norma já foram todas consultadas durante as Sprints 3 e 7.
-2. **Higiene de repositório:** decidir o destino de `src/interface/` (GUIs de demonstração ainda não rastreadas) e mergear a linha de sprints para `main`.
+1. **Validação cruzada (único passo pendente):** confrontar os vetores de wire (D_PDU, EOW, S_PDU) com outro stack 5066 conformante em teste de interoperabilidade real, como passo final de homologação. É uma etapa **externa** — exige uma segunda implementação conformante como contraparte. As figuras da norma já foram todas consultadas durante as Sprints 3 e 7.
+2. **Higiene de repositório — ✅ CONCLUÍDA (2026-06-24):** `src/interface/` foi rastreado (commit `6822689`, GUIs Tkinter de chat HF) com `.gitignore` próprio para os artefatos de runtime (`recebidos/`); nenhum `__pycache__`/`.pyc` permanece no índice (commit `693b47c`). A linha de sprints foi mergeada para `main` (PR #1, commit `8010047`); `main` está sincronizada com `origin/main`.
 
 ---
 
