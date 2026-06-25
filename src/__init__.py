@@ -23,6 +23,7 @@ from src.dpdu_frame import (
     flip_bit,
 )
 from src.modem.hf_modem_adapter import HFModemAdapter
+from src.modem.tcp_110d_adapter import Tcp110dConfig, Tcp110dModemAdapter
 from src.modem_if import ModemConfig, ModemInterface
 from src.non_arq import NonArqEngine
 from src.arq import ArqEngine
@@ -45,6 +46,8 @@ __all__ = [
     "DPDU",
     "DPDUType",
     "HFModemAdapter",
+    "Tcp110dConfig",
+    "Tcp110dModemAdapter",
     "ModemConfig",
     "ModemInterface",
     "NonArqDelivery",
