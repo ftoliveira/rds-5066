@@ -47,7 +47,8 @@ class NodeController(QObject):
 
     def __init__(self, local_id: int, remote_id: int, host: str, port: int,
                  *, bitrate: int = 2400, interleaver: str = "long",
-                 bound_saps=(3, 5), parent: Optional[QObject] = None):
+                 bound_saps=(3, 5, 6, 7), max_user_data_bytes: int = 128,
+                 parent: Optional[QObject] = None):
         super().__init__(parent)
         self.local_id = local_id
         self.remote_id = remote_id
@@ -56,6 +57,7 @@ class NodeController(QObject):
         self.bitrate = int(bitrate)
         self.interleaver = interleaver
         self.bound_saps = tuple(bound_saps)
+        self.max_user_data_bytes = int(max_user_data_bytes)
 
         self.node: Optional[StanagNode] = None
         self._thread: Optional[threading.Thread] = None
@@ -91,7 +93,7 @@ class NodeController(QObject):
         node = StanagNode(
             self.local_id, adapter,
             cas_config=CasConfig(call_timeout_seconds=15.0, break_timeout_seconds=10.0, max_retries=3),
-            max_user_data_bytes=128,
+            max_user_data_bytes=self.max_user_data_bytes,
             use_arq_data=True,
             soft_link_idle_timeout_ms=60_000,
             arq_reset_retransmit_ms=3000,
@@ -210,8 +212,9 @@ class NodeController(QObject):
             return {"running": False, "connected": False, "rate": self.bitrate}
         snap = {"running": True, "connected": False, "rate": self.bitrate,
                 "blocking": 0, "cas": "IDLE", "sis_state": "IDLE", "sis_type": "-",
-                "dts": "-", "arq_state": "-", "arq_window": 0, "arq_queue": 0,
-                "arq_lwe": 0, "arq_uwe": 0, "reset_pending": False, "tx_queue": 0}
+                "dts": "-", "arq_state": "-", "arq_window": 0, "arq_unacked": 0,
+                "arq_queue": 0, "arq_lwe": 0, "arq_uwe": 0, "reset_pending": False,
+                "tx_queue": 0}
         try:
             m = node.modem
             snap["connected"] = bool(getattr(m, "is_connected", False))
@@ -237,6 +240,10 @@ class NodeController(QObject):
             arq = node.arq
             snap["arq_state"] = _enum_name(arq._tx_state)
             snap["arq_window"] = len(arq._tx_window)
+            # Frames still in flight (not yet ACKed=1) — drives file-transfer
+            # progress so the count drains to zero once the peer confirms.
+            snap["arq_unacked"] = sum(1 for s in arq._tx_window.values()
+                                      if getattr(s, "status", 0) != 1)
             snap["arq_queue"] = len(arq._tx_queue)
             snap["arq_lwe"] = int(arq._tx_lwe)
             snap["arq_uwe"] = int(arq._tx_uwe)

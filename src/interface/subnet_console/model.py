@@ -36,6 +36,12 @@ SAP_NAMES = {1: "COSS", 2: "T-MMHS (S4406E)", 3: "HMTP", 4: "HFPOP",
 # default: ARQ + NODE DELIVERY + IN-ORDER, priority 4, rank 15.
 CHAT_CFG_DEFAULT = {"arq": True, "confirm": "node", "in_order": True, "priority": 4, "rank": 15}
 
+# File transfer SAPs (Annex F) and the chunk-protocol prefixes (mirrors
+# chat_app_110d._send_file): "<TAG>:<filename>\x00<data>", all tags 5 bytes.
+RCOP_SAP = 6   # Reliable Connection-Oriented Protocol — ARQ
+UDOP_SAP = 7   # Unreliable Datagram-Oriented Protocol — non-ARQ
+FT_PREFIXES = (b"FILE:", b"FALL:", b"FCON:", b"FEND:")
+
 
 def _now() -> str:
     return time.strftime("%H:%M:%S")
@@ -130,7 +136,12 @@ class ConsoleModel(QObject):
         self.ft_pri = 6
         self.ft_seq = 0
         self.ft_staged: List[dict] = []
-        self.ft_queue: List[dict] = [
+        # Live: a fila arranca vazia e é preenchida por envios/recepções reais.
+        self.ft_received: List[dict] = []   # ficheiros reassemblados (RX)
+        self.ft_rx_buffers: dict = {}       # {filename: bytearray} em curso
+        self.ft_events: List[tuple] = []    # (time, dir, prim, proto, detail) — log RCOP/UDOP
+        self.ft_active: Optional[dict] = None   # transferência em curso (progresso)
+        self.ft_queue: List[dict] = [] if self.live else [
             {"id": "q0", "name": "imagery_tile_0842.jp2", "proto": "RCOP", "dest": "3.066.000.006",
              "size": "184 KB", "pri": 6, "pct": 38, "st": "SENDING"},
             {"id": "q1", "name": "sitrep_1500z.pdf", "proto": "RCOP", "dest": "3.066.000.004",
@@ -187,6 +198,8 @@ class ConsoleModel(QObject):
             # These four surfaces all read the status snapshot.
             for topic in ("modem", "dashboard", "monitor", "statusbar"):
                 self.changed.emit(topic)
+        # File-transfer progress tracks the queue draining, so poll it every tick.
+        self._update_ft_progress(snap)
 
     def _bound_sap_count(self) -> int:
         if self.live and self.controller is not None:
@@ -229,11 +242,17 @@ class ConsoleModel(QObject):
         """
         sap = int(ind.get("sap", 0))
         src = int(ind.get("src_addr", 0))
-        nbytes = len(ind.get("updu", b"") or b"")
+        updu = ind.get("updu", b"") or b""
+        nbytes = len(updu)
         self.live_rx += 1
+        is_file = updu[:5] in FT_PREFIXES
         self._log_event("S_UNIDATA_INDICATION", sap=sap, src=f"·{src:03d}", dst="local",
                         size=f"{nbytes} B", result="OK",
-                        detail=f"from node {src} · {nbytes} oct", chat=(sap == CHAT_SAP))
+                        detail=f"from node {src} · {nbytes} oct",
+                        chat=(sap == CHAT_SAP and not is_file))
+        if is_file:
+            self._handle_ft_rx(updu, src, sap)
+            return
         if sap != CHAT_SAP:
             return
         text = (ind.get("text") or "").rstrip("\r\n")
@@ -414,10 +433,11 @@ class ConsoleModel(QObject):
         self.changed.emit("filexfer")
 
     def stage_files(self, files: List[tuple]) -> None:
-        """``files``: list of ``(name, bytes)``."""
-        for i, (name, nbytes) in enumerate(files):
-            self.ft_staged.append({"id": f"f{self.ft_seq}_{i}", "name": name,
-                                   "bytes": nbytes, "size": _fmt_size(nbytes)})
+        """``files``: list of ``(name, data_bytes)`` — o conteúdo é preciso p/ envio live."""
+        for i, (name, data) in enumerate(files):
+            data = data or b""
+            self.ft_staged.append({"id": f"f{self.ft_seq}_{i}", "name": name, "bytes": len(data),
+                                   "data": data, "size": _fmt_size(len(data))})
         self.ft_seq += 1
         self.changed.emit("filexfer")
 
@@ -428,6 +448,9 @@ class ConsoleModel(QObject):
     def send_ft(self) -> None:
         if not self.ft_staged:
             return
+        if self.live and self.controller is not None:
+            self._send_ft_live()
+            return
         jobs = []
         for i, f in enumerate(self.ft_staged):
             jobs.append({"id": f"q{self.ft_seq}_{i}", "name": f["name"], "proto": self.ft_proto,
@@ -437,6 +460,153 @@ class ConsoleModel(QObject):
         self.ft_staged = []
         self.ft_seq += 1
         self.changed.emit("filexfer")
+
+    # ---- file transfer live (Fatia 4): chunk/send, RX reassembly, progresso ----
+    def _log_ft(self, direction: str, prim: str, proto: str, detail: str) -> None:
+        self.ft_events.insert(0, (_now(), direction, prim, proto, detail))
+        del self.ft_events[120:]
+
+    def _chunk_file(self, filename: str, data: bytes) -> list:
+        """Fatiar ``data`` em blocos MTU com prefixos FILE/FCON/FEND/FALL (Annex F)."""
+        mtu = getattr(self.controller, "max_user_data_bytes", 128) if self.controller else 128
+        pfx_file = f"FILE:{filename}\x00".encode("utf-8")
+        pfx_cont = f"FCON:{filename}\x00".encode("utf-8")
+        pfx_end = f"FEND:{filename}\x00".encode("utf-8")
+        pfx_all = f"FALL:{filename}\x00".encode("utf-8")
+        size = len(data)
+        if size == 0:
+            return [pfx_all]
+        chunks: list = []
+        offset = 0
+        while offset < size:
+            pfx = pfx_file if offset == 0 else pfx_cont
+            space = max(1, mtu - len(pfx))
+            chunk = data[offset:offset + space]
+            if offset == 0 and len(chunk) >= size:
+                pfx = pfx_all           # cabe num único bloco
+            elif offset + len(chunk) >= size:
+                pfx = pfx_end           # último bloco de vários
+            chunks.append(pfx + chunk)
+            offset += len(chunk)
+        return chunks
+
+    def _send_ft_live(self) -> None:
+        from src.stypes import DeliveryMode  # lazy: mantém o modo demo sem backend
+        arq = self.ft_is_rcop
+        sap = RCOP_SAP if arq else UDOP_SAP
+        proto = self.ft_proto
+        mode = DeliveryMode(arq_mode=arq, in_order=arq, node_delivery_confirm=arq)
+        remote = self.controller.remote_id
+        s = self._live_status
+        baseline = (int(s.get("tx_queue") or 0) + int(s.get("arq_queue") or 0)
+                    + int(s.get("arq_unacked") or 0))
+        order, new_jobs = [], []
+        for i, f in enumerate(self.ft_staged):
+            chunks = self._chunk_file(f["name"], f.get("data", b""))
+            jid = f"tx{self.ft_seq}_{i}"
+            job = {"id": jid, "name": f["name"], "proto": proto, "dest": f"node {remote}",
+                   "size": f["size"], "pri": self.ft_pri, "pct": 0, "st": "QUEUED"}
+            new_jobs.append(job)
+            failed = False
+            for ch in chunks:
+                try:
+                    self.controller.send_unidata(sap, sap, ch, priority=int(self.ft_pri), mode=mode)
+                    self.live_tx += 1
+                except Exception as exc:
+                    self.live_rejected += 1
+                    job["st"] = "FAILED"
+                    self._log_ft("TX", "S_UNIDATA_REQUEST_REJECTED", proto, f"{f['name']}: {exc}")
+                    failed = True
+                    break
+            if not failed:
+                order.append((jid, len(chunks)))
+                self._log_ft("TX", "S_UNIDATA_REQUEST", proto,
+                             f"{f['name']} · SAP {sap} · {len(chunks)} blk · {'ARQ' if arq else 'non-ARQ'}")
+                self._log_event("S_UNIDATA_REQUEST", sap=sap, src="local", dst=f"·{remote:03d}",
+                                size=f"{len(chunks)} blk", result="OK",
+                                detail=f"{f['name']} · {proto} · {len(chunks)} chunks")
+        self.ft_queue = new_jobs + self.ft_queue
+        self.ft_staged = []
+        self.ft_seq += 1
+        if order:
+            self.ft_active = {"order": order, "total": sum(n for _, n in order),
+                              "baseline": baseline, "arq": arq}
+        self.changed.emit("filexfer")
+
+    def _update_ft_progress(self, snap: dict) -> None:
+        """Repartir o esvaziamento da fila (FIFO) pelos jobs da transferência ativa."""
+        act = self.ft_active
+        if not act:
+            return
+        pending = (int(snap.get("tx_queue") or 0) + int(snap.get("arq_queue") or 0)
+                   + int(snap.get("arq_unacked") or 0))
+        my_pending = max(0, pending - act["baseline"])
+        resolved = max(0, act["total"] - my_pending)
+        jobs = {j["id"]: j for j in self.ft_queue}
+        done_state = "DELIVERED" if act["arq"] else "SENT"
+        remaining = resolved
+        changed = False
+        for jid, n in act["order"]:
+            j = jobs.get(jid)
+            here = min(remaining, n)
+            remaining -= here
+            if j is None:
+                continue
+            pct = 100 if n == 0 else round(here / n * 100)
+            st = done_state if pct >= 100 else ("SENDING" if here > 0 else "QUEUED")
+            if j.get("pct") != pct or j.get("st") != st:
+                j["pct"], j["st"] = pct, st
+                changed = True
+        if my_pending == 0:
+            for jid, n in act["order"]:
+                j = jobs.get(jid)
+                if j is not None:
+                    j["pct"], j["st"] = 100, done_state
+            self._log_ft("RX" if act["arq"] else "TX",
+                         "S_UNIDATA_REQUEST_CONFIRM" if act["arq"] else "UDOP_DATAGRAM",
+                         self.ft_proto, "transfer complete" if act["arq"] else "datagrams sent")
+            self.ft_active = None
+            changed = True
+        if changed:
+            self.changed.emit("filexfer")
+
+    def _handle_ft_rx(self, raw: bytes, src: int, sap: int) -> None:
+        null = raw.find(b"\x00")
+        if null < 0:
+            return
+        try:
+            header = raw[:null].decode("utf-8")
+        except UnicodeDecodeError:
+            return
+        tag, _, filename = header.partition(":")
+        if not filename:
+            return
+        data = raw[null + 1:]
+        proto = "RCOP" if sap == RCOP_SAP else ("UDOP" if sap == UDOP_SAP else "FILE")
+        if tag == "FALL":
+            self._log_ft("RX", "FALL", proto, f"{filename} · {len(data)} B · 1 chunk")
+            self._ft_rx_complete(filename, bytes(data), src, proto)
+        elif tag == "FILE":
+            self.ft_rx_buffers[filename] = bytearray(data)
+            self._log_ft("RX", "FILE", proto, f"{filename} · chunk 1 · {len(data)} B")
+        elif tag == "FCON":
+            buf = self.ft_rx_buffers.setdefault(filename, bytearray())
+            buf.extend(data)
+            self._log_ft("RX", "FCON", proto, f"{filename} · +{len(data)} B ({len(buf)} B)")
+        elif tag == "FEND":
+            buf = self.ft_rx_buffers.pop(filename, bytearray())
+            buf.extend(data)
+            self._log_ft("RX", "FEND", proto, f"{filename} · {len(buf)} B complete")
+            self._ft_rx_complete(filename, bytes(buf), src, proto)
+        self.changed.emit("filexfer")
+
+    def _ft_rx_complete(self, filename: str, data: bytes, src: int, proto: str) -> None:
+        self.ft_received.append({"name": filename, "data": data, "size": _fmt_size(len(data)),
+                                 "from": src, "time": _now(), "proto": proto})
+        self.ft_queue.insert(0, {
+            "id": f"rx{len(self.ft_received)}", "name": filename, "proto": proto,
+            "dest": f"node {src}", "size": _fmt_size(len(data)), "pri": "—",
+            "pct": 100, "st": "RECEIVED"})
 
     # -------------------------------------------------------------- misc cmd
     def set_cfg_tab(self, tab: str) -> None:
@@ -953,6 +1123,19 @@ class ConsoleModel(QObject):
     def ft_kpis(self) -> list:
         gd = T.GREEN_DARK
         q = str(self._ft_active_count())
+        if self.live:
+            mtu = getattr(self.controller, "max_user_data_bytes", 128) if self.controller else 128
+            active = sum(1 for j in self.ft_queue if j["st"] == "SENDING")
+            return [
+                {"label": "Active Transfer", "value": str(active), "unit": "job",
+                 "delta": f"{self.ft_proto} · {'ARQ' if self.ft_is_rcop else 'non-ARQ'}"},
+                {"label": "Queue Depth", "value": q, "unit": "jobs",
+                 "delta": "SAP 6/7 bound", "delta_color": gd},
+                {"label": "Files Received", "value": str(len(self.ft_received)), "unit": "files",
+                 "delta": "reassembled" if self.ft_received else "none yet",
+                 "delta_color": gd if self.ft_received else T.FG_DIM},
+                {"label": "SIS MTU", "value": str(mtu), "unit": "oct", "delta": "max U-PDU / chunk"},
+            ]
         if self.ft_is_rcop:
             return [
                 {"label": "Active Transfer", "value": "1", "unit": "job", "delta": "imagery_tile · 38%"},
@@ -1003,7 +1186,7 @@ class ConsoleModel(QObject):
     def ft_queue_view(self) -> list:
         a = self.theme.accent
         def qst(st):
-            if st in ("DELIVERED", "SENT"):
+            if st in ("DELIVERED", "SENT", "RECEIVED"):
                 return T.GREEN_DARK, T.GREEN_BG, T.GREEN
             if st == "SENDING":
                 return a, self.theme.tint(0.9), a
@@ -1022,11 +1205,15 @@ class ConsoleModel(QObject):
     def ft_log(self) -> list:
         a = self.theme.accent
         def color(n):
-            if "ERROR" in n or "RESET" in n:
+            if "REJECT" in n or "ERROR" in n or "RESET" in n:
                 return T.RED
             if "CONFIRM" in n or "ACCEPT" in n or "DELIVER" in n:
                 return T.GREEN_DARK
             return a
+        if self.live:
+            return [{"time": t, "dir": d, "name": n, "proto": p, "detail": dt,
+                     "color": color(n), "dir_fg": a if d == "TX" else T.PURPLE}
+                    for t, d, n, p, dt in self.ft_events]
         if self.ft_is_rcop:
             raw = [
                 ("14:22:09", "TX", "RCOP_DATA_BLOCK", "RCOP", "blk 142/371 · 512 oct"),

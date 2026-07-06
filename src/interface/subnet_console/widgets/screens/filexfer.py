@@ -254,8 +254,10 @@ class FileTransferScreen(Screen):
         files = []
         for p in paths:
             try:
-                files.append((os.path.basename(p), os.path.getsize(p)))
+                with open(p, "rb") as fh:
+                    data = fh.read()
             except OSError:
-                files.append((os.path.basename(p), 0))
+                data = b""
+            files.append((os.path.basename(p), data))
         if files:
             self.model.stage_files(files)

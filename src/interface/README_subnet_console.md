@@ -83,7 +83,7 @@ Opções de linha de comando:
 | SIS CLIENTS | **HFCHAT Orderwire** (SAP 5) | operadores (demo), *thread* + *feed* ao vivo, hard link | **✅ live** |
 | SIS CLIENTS | **HF Mail** (HMTP 3 / HFPOP 4) | caixas, leitura/composição, *pipelining* HMTP | demo |
 | SIS CLIENTS | **IP Client** (SAP 9) | binding, QoS, rotas IP→STANAG, log de datagramas | demo |
-| SIS CLIENTS | **File Transfer** (RCOP 6 / UDOP 7) | compositor, fila, log de primitivas | demo |
+| SIS CLIENTS | **File Transfer** (RCOP 6 / UDOP 7) | chunking FILE/FCON/FEND/FALL, envio, RX+reassembly, progresso | **✅ live** |
 | SIS CLIENTS | **Raw SIS Socket** (F.16) | parâmetros, clientes ligados, *wire log* | demo |
 | SETUP | **Modem Link** (110C no design / 110D real) | ligação, taxa, interleaver | **✅ live** |
 | SETUP | **Configuration** | servidor SIS; requisitos HFCHAT (ARQ/prio/in-order/confirm) ligados ao envio | **✅ HFCHAT live** |
@@ -145,7 +145,9 @@ estado na thread da GUI. Já expõe **tudo** o que as próximas fatias precisam:
 `send_unidata(sap, dest_sap, payload, priority=4, ttl_seconds=0.0, mode=DeliveryMode)`.
 
 **`status()` → dict:** `running, connected, rate, blocking, cas, sis_state, sis_type,
-dts, arq_state, arq_window, arq_queue, arq_lwe, arq_uwe, reset_pending, tx_queue`.
+dts, arq_state, arq_window, arq_unacked, arq_queue, arq_lwe, arq_uwe, reset_pending,
+tx_queue`. (`arq_unacked` = frames em voo ainda não confirmados — o progresso de ficheiros
+usa-o para a fila drenar a zero. SAPs ligados por omissão: `(3, 5, 6, 7)`.)
 
 ## 6. Estado e roteiro da Fase 2 (atividades)
 
@@ -174,9 +176,16 @@ Fatiar por ecrã, sempre verificando *headless* contra `tests/mock_110d_modem`
       estado (`statusbar_view`); contadores `live_tx`/`live_rx`/`live_rejected` agregam o tráfego.
       `apply_live_status` repinta dashboard/monitor/statusbar quando um campo visível muda; os
       ecrãs ganharam `topics={"dashboard"}`/`{"monitor"}`. Coberto por `test_subnet_console_chat.py`.
-- [ ] **Fatia 4 — File Transfer (RCOP 6 / UDOP 7)**
-      Fatiar ficheiro em chunks com o protocolo `FILE:/FCON:/FEND:/FALL:` (ver
-      `chat_app_110d._send_file`), RCOP→ARQ / UDOP→non-ARQ, progresso na fila e log.
+- [x] **Fatia 4 — File Transfer (RCOP 6 / UDOP 7)** *(feito)*
+      `NodeController` liga também os SAPs 6/7 (`bound_saps=(3,5,6,7)`) e expõe
+      `max_user_data_bytes`. `send_ft` (live) fatia cada ficheiro com o protocolo
+      `FILE:/FCON:/FEND:/FALL:<nome>\x00<dados>` (blocos MTU, ver `_chunk_file`), enfileira via
+      `send_unidata` em SAP 6 (RCOP → `DeliveryMode(arq_mode=True)`) ou 7 (UDOP → non-ARQ). O
+      progresso vem do esvaziamento da fila (`tx_queue`+`arq_queue`+`arq_unacked` no snapshot,
+      repartido FIFO pelos jobs em `_update_ft_progress`). `on_rx` deteta os prefixos e
+      reassembla (`_handle_ft_rx` → `ft_received`), mostrando o ficheiro recebido na fila e o
+      log RCOP/UDOP (`ft_events`). Verificado ponta a ponta (UDOP e RCOP c/ hard link) em
+      `tests/test_subnet_console_filexfer.py`.
 - [ ] **Fatia 5 — Raw SIS Socket (F.16)**
       Correr `RawSisSocketServer(node, "127.0.0.1", 5066/5067)` num loop asyncio em
       thread própria (ver `chat_app_110d._start_sis_api`); listar clientes/wire log reais.

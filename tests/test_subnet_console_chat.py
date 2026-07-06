@@ -105,11 +105,12 @@ def test_hfchat_live_end_to_end(qapp):
         assert model_a.counters()[1]["value"] == str(model_a.live_tx)  # U-PDUs TX
         assert model_a.live_tx >= 1 and model_b.live_rx >= 1
 
-        # SAP table ao vivo: SAP 5 BOUND com contagem de RX no nó B.
+        # SAP table ao vivo: SAP 5 BOUND com contagem de RX no nó B; SAP 6 (RCOP)
+        # também está bound (Fatia 4); SAP 1 permanece UNBOUND.
         row5_b = next(r for r in model_b.sap_table() if r["sap"] == "5")
         assert row5_b["state"] == "BOUND" and int(row5_b["rx"]) >= 1
-        row6_b = next(r for r in model_b.sap_table() if r["sap"] == "6")
-        assert row6_b["state"] == "UNBOUND"
+        assert next(r for r in model_b.sap_table() if r["sap"] == "6")["state"] == "BOUND"
+        assert next(r for r in model_b.sap_table() if r["sap"] == "1")["state"] == "UNBOUND"
 
         # KPIs e barra de estado refletem o snapshot de status().
         assert model_a.dashboard_kpis()[0]["value"] == "UP"          # Modem Link
