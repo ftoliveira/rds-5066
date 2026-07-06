@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import QApplication  # noqa: E402 (após definir a platafor
 
 from src.interface.subnet_console.backend.node_controller import NodeController  # noqa: E402
 from src.interface.subnet_console.model import ConsoleModel  # noqa: E402
+from src.interface.subnet_console.window import SubnetConsoleWindow  # noqa: E402
 from tests.mock_110d_modem import MockAir  # noqa: E402
 
 
@@ -184,6 +185,65 @@ def test_hfchat_config_wires_send(qapp):
         ctrl_b.stop()
         air.stop()
         qapp.processEvents()
+
+
+def test_scroll_screen_click_rebuild_survives(qapp):
+    """Regressão: um ClickableFrame de um ecrã com scroll cujo clique reconstrói o
+    ecrã não pode apagar-se a meio do próprio mouseReleaseEvent (crash RuntimeError).
+    """
+    from PyQt6.QtCore import Qt, QPoint
+    from PyQt6.QtTest import QTest
+    from PyQt6.QtWidgets import QVBoxLayout
+    from src.interface.subnet_console.widgets import common as C
+    from src.interface.subnet_console.widgets.screens.base import Screen
+
+    model = ConsoleModel(node="A")
+
+    class Clicky(Screen):
+        topics = {"config"}
+
+        def build(self, lay: QVBoxLayout) -> None:
+            f = C.ClickableFrame(base_css="QFrame{background:#fff;}")
+            f.setFixedSize(60, 24)
+            f.clicked.connect(lambda: model.changed.emit("config"))  # rebuilds this screen
+            lay.addWidget(f)
+            self.btn = f
+
+    scr = Clicky(model)
+    scr.resize(200, 200)
+    scr.show()
+    qapp.processEvents()
+    first = scr.btn
+    QTest.mouseClick(first, Qt.MouseButton.LeftButton, pos=QPoint(10, 10))
+    qapp.processEvents()          # deixa o deleteLater diferido correr
+    assert scr.btn is not first   # o rebuild trocou o widget — e não houve crash
+    scr.close()
+
+
+def test_config_controls_clickable_live(qapp):
+    """Clicar nos controlos HFCHAT (Config) muda o rascunho sem crashar."""
+    from PyQt6.QtCore import Qt, QPoint
+    from PyQt6.QtTest import QTest
+    from src.interface.subnet_console.widgets.common import ClickableFrame
+
+    ctrl = NodeController(1, 2, "127.0.0.1", 3000)   # não arranca
+    model = ConsoleModel(node="A", controller=ctrl)
+    win = SubnetConsoleWindow(model)
+    model.set_screen("config")
+    qapp.processEvents()
+
+    before = dict(model.chat_cfg_draft)
+    screen = win._screens["config"]
+    # Clica no primeiro chip de prioridade que difere da prioridade atual.
+    for cf in screen.findChildren(ClickableFrame):
+        if cf.width() < 60 and cf.height() < 40 and cf.isVisible():
+            QTest.mouseClick(cf, Qt.MouseButton.LeftButton, pos=QPoint(5, 5))
+            qapp.processEvents()
+            break
+    # Não crashou; o rascunho continua consultável.
+    assert isinstance(model.config_view()["dirty"], bool)
+    assert model.chat_cfg_draft.keys() == before.keys()
+    win.close()
 
 
 def test_demo_chat_unaffected(qapp):

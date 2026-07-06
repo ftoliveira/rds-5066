@@ -71,7 +71,15 @@ class Screen(QWidget):
         if self.scroll and not self.full_height:
             lay.addStretch(1)
         if self._area is not None:
+            # Defer deletion of the outgoing content: a rebuild is often driven by
+            # a click on a widget *inside* that content (e.g. a config toggle), and
+            # QScrollArea.setWidget() would delete it synchronously — mid-event —
+            # crashing the click handler. takeWidget() detaches without deleting;
+            # deleteLater() then frees it safely once the event unwinds.
+            old = self._area.takeWidget()
             self._area.setWidget(content)
+            if old is not None:
+                old.deleteLater()
         else:
             # replace the single direct child
             while self._root.count():

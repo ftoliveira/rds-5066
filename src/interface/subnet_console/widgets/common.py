@@ -155,9 +155,13 @@ class ClickableFrame(QFrame):
         super().leaveEvent(e)
 
     def mouseReleaseEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.pos()):
-            self.clicked.emit()
+        hit = e.button() == Qt.MouseButton.LeftButton and self.rect().contains(e.pos())
+        # Run the base handler *before* emitting: a ``clicked`` slot may rebuild
+        # this widget's screen and delete ``self``, so nothing may touch ``self``
+        # after the emit. Keeping the emit last makes it safe.
         super().mouseReleaseEvent(e)
+        if hit:
+            self.clicked.emit()
 
 
 def caption(text: str, *, color: str = T.FG_FAINT, size: float = 10, weight: int = 600) -> QLabel:
