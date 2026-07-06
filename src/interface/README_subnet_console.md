@@ -32,7 +32,8 @@ fiel do *data path* completo e o guia para ligar as próximas telas ao vivo.
 ```
 
 > **Estado:** Fase 1 (UI completa, dados de demonstração) **concluída**. Fase 2
-> (ligação ao backend real) **em progresso** — ver §6. Branch: `feat/qt-subnet-console`.
+> (ligação ao backend real) **concluída** — as 6 fatias feitas, todos os ecrãs SIS ao
+> vivo (ver §6). Branch: `feat/qt-subnet-console`.
 
 ---
 
@@ -81,8 +82,8 @@ Opções de linha de comando:
 | SECTIONS | **Subnet Dashboard** | KPIs, peer/link, métricas de ligação, SAPs, filas, S-Primitives | **✅ live** |
 | SECTIONS | **Traffic Monitor** | contadores, alocação de SAP (Anexo F Tabela F-1), event log | **✅ live** |
 | SIS CLIENTS | **HFCHAT Orderwire** (SAP 5) | operadores (demo), *thread* + *feed* ao vivo, hard link | **✅ live** |
-| SIS CLIENTS | **HF Mail** (HMTP 3 / HFPOP 4) | caixas, leitura/composição, *pipelining* HMTP | demo |
-| SIS CLIENTS | **IP Client** (SAP 9) | binding, QoS, rotas IP→STANAG, log de datagramas | demo |
+| SIS CLIENTS | **HF Mail** (HMTP 3 / HFPOP 4) | caixas, leitura/composição, submit HMTP + RX ao vivo | **✅ live** |
+| SIS CLIENTS | **IP Client** (SAP 9) | binding, QoS, rotas IP→STANAG, envio+RX de datagramas | **✅ live** |
 | SIS CLIENTS | **File Transfer** (RCOP 6 / UDOP 7) | chunking FILE/FCON/FEND/FALL, envio, RX+reassembly, progresso | **✅ live** |
 | SIS CLIENTS | **Raw SIS Socket** (F.16) | parâmetros, clientes ligados, *wire log* | **✅ live** |
 | SETUP | **Modem Link** (110C no design / 110D real) | ligação, taxa, interleaver | **✅ live** |
@@ -98,6 +99,12 @@ Opções de linha de comando:
 > **Connect/Disconnect Modem**) em `127.0.0.1:5066` (nó A) / `:5067` (nó B). Clientes SIS
 > externos podem então ligar-se e fazer bind de SAPs por TCP; o ecrã **Raw SIS Socket** mostra
 > os clientes ligados e o *wire log* ao vivo. Até ligar o modem o ecrã mostra **SERVER OFFLINE**.
+>
+> **IP Client (SAP 9) & HF Mail (HMTP 3 / HFPOP 4):** tráfego unicast (IP e HMTP) é ARQ,
+> portanto precisa de enlace — estabeleça primeiro o **hard link** (cabeçalho da *thread*
+> HFCHAT). No ecrã **IP Client**, **Send Test Datagram** injeta um datagrama IPv4 no par; no
+> **HF Mail**, **Submit to HF** envia o mail-object por HMTP e **Poll HFPOP** faz RETR. O nó
+> recetor mostra o datagrama no *log* e o mail-object na *inbox*.
 
 ## 4. Arquitetura
 
@@ -155,8 +162,8 @@ dts, arq_state, arq_window, arq_unacked, arq_queue, arq_lwe, arq_uwe, reset_pend
 tx_queue`, e (Fatia 5) `sis_server_running, sis_server_host, sis_server_port,
 sis_max_clients, sis_clients, sis_wire, sis_prim_count`. (`arq_unacked` = frames em voo
 ainda não confirmados — o progresso de ficheiros usa-o para a fila drenar a zero. SAPs
-ligados por omissão: `(3, 5, 6, 7)`. O Raw SIS Socket Server arranca junto do nó em
-`start()` e fecha em `stop()`.)
+ligados por omissão: `(3, 4, 5, 6, 7, 9)` — HMTP, HFPOP, HFCHAT, RCOP, UDOP e IP Client.
+O Raw SIS Socket Server arranca junto do nó em `start()` e fecha em `stop()`.)
 
 ## 6. Estado e roteiro da Fase 2 (atividades)
 
@@ -210,9 +217,20 @@ Fatiar por ecrã, sempre verificando *headless* contra `tests/mock_110d_modem`
       sem *locks*: `deque.append` + `list(...)` e cópias atómicas de dict (ver docstring do
       módulo). Verificado ponta a ponta (cliente TCP real → bind SAP 9 → aparece na consola +
       wire log) em `tests/test_subnet_console_sissocket.py`.
-- [ ] **Fatia 6 — IP Client (SAP 9) + HF Mail (HMTP 3/HFPOP 4)**
-      Ligar os clientes `annex_f/*` (`ip_client`, `hmtp`, `hf_pop3`); maior esforço,
-      menor prioridade.
+- [x] **Fatia 6 — IP Client (SAP 9) + HF Mail (HMTP 3/HFPOP 4)** *(feito)*
+      `NodeController` liga também os SAPs 4 e 9 (`bound_saps=(3,4,5,6,7,9)`). O modelo
+      instancia os clientes `annex_f` reais (`IPClient`, `HMTPClient`/`HMTPServer`,
+      `HFPOP3Client`) por trás de um `_ClientNode`: a TX é reencaminhada por
+      `controller.send_unidata` e a descodificação de RX corre na thread da GUI a partir
+      de `on_rx` (as *callbacks* dos clientes nunca tocam a thread de tick). **IP Client:**
+      o botão **Send Test Datagram** monta um datagrama IPv4 mínimo e envia-o via
+      `IPClient.send_ip_datagram` (unicast → ARQ, SAP 9); o RX descodifica e alimenta o
+      *datagram log* e os KPIs (`ip_kpis/ip_bind/ip_routes/ip_log` ramificam em `self.live`,
+      ecrã com `topics={"ipclient"}`). **HF Mail:** **Submit to HF** encapsula o mail-object
+      como uma transação HMTP `EHLO…QUIT` e envia-o em SAP 3; o par recebe-o, o `HMTPServer`
+      parseia-o (nó *swallow*, sem resposta no ar) e mostra-o na *inbox*; **Poll HFPOP** faz
+      RETR em SAP 4 (`mail_view` ramifica nas caixas ao vivo). Verificado ponta a ponta (A→B
+      via `MockAir`) em `tests/test_subnet_console_ipmail.py`.
 
 ### Padrão para ligar um ecrã ao vivo
 

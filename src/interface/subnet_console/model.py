@@ -42,6 +42,11 @@ RCOP_SAP = 6   # Reliable Connection-Oriented Protocol — ARQ
 UDOP_SAP = 7   # Unreliable Datagram-Oriented Protocol — non-ARQ
 FT_PREFIXES = (b"FILE:", b"FALL:", b"FCON:", b"FEND:")
 
+# Fatia 6 — HF Mail + IP Client SAPs (Annex F Table F-1).
+HMTP_SAP = 3    # HF Mail Transfer Protocol — SMTP-over-HF submit (F.5)
+HFPOP_SAP = 4   # HF POP3 — mail retrieval (F.6)
+IP_SAP = 9      # IP Client — IPv4 datagram transport (F.12)
+
 
 def _now() -> str:
     return time.strftime("%H:%M:%S")
@@ -68,6 +73,30 @@ def _fmt_size(b: int) -> str:
     if b >= 1024:
         return f"{round(b / 1024)} KB"
     return f"{b} B"
+
+
+class _ClientNode:
+    """Minimal ``StanagNode`` stand-in for the Annex F clients (Fatia 6).
+
+    ``ip_client``/``hmtp``/``hf_pop3`` all reach the SIS through
+    ``node.unidata_request``. With a controller, TX is forwarded to the live
+    node — ``send_unidata`` always targets ``controller.remote_id`` (the same
+    address the clients resolve to), so ``dest_addr`` is dropped. Without one it
+    swallows output, letting a server-side parser (``HMTPServer``) decode an
+    inbound buffer without emitting a reply onto the wire.
+    """
+
+    def __init__(self, controller=None):
+        self._controller = controller
+
+    def unidata_request(self, sap_id, dest_addr, dest_sap, priority,
+                        ttl_seconds, mode=None, updu=b"") -> None:
+        if self._controller is not None:
+            self._controller.send_unidata(sap_id, dest_sap, updu, priority=priority,
+                                          ttl_seconds=ttl_seconds, mode=mode)
+
+    def bind(self, *args, **kwargs) -> None:   # SAPs already bound by the controller
+        pass
 
 
 class ConsoleModel(QObject):
@@ -152,6 +181,26 @@ class ConsoleModel(QObject):
              "size": "9 KB", "pri": 6, "pct": 0, "st": "QUEUED"},
         ]
 
+        # ---- live mail (Fatia 6): HMTP SAP 3 submit / HFPOP SAP 4 retrieve ----
+        # Recebidos e enviados ao vivo; a fila `mail_view` ramifica nestas listas.
+        self.live_inbox: List[dict] = []    # mail-objects recebidos (SAP 3/4)
+        self.live_sent: List[dict] = []     # mail-objects submetidos via HMTP
+        self.live_outbox: List[dict] = []   # (reservado) submissões em trânsito
+        self.mail_seq = 0
+
+        # ---- live IP client (Fatia 6): SAP 9 ----
+        self.ip_events: List[dict] = []     # log de datagramas (newest first)
+        self.ip_tx = 0
+        self.ip_rx = 0
+        self.ip_dropped = 0
+
+        # Clientes Annex F (lazy; construídos no 1.º uso live) — ver _ensure_clients.
+        self._client_node = None
+        self._ip = None
+        self._hmtp = None
+        self._hfpop = None
+        self._hmtp_server = None
+
         self.cfg_tab = "chat"
 
         # ---- chat state ----
@@ -205,6 +254,11 @@ class ConsoleModel(QObject):
                 or prev.get("sis_prim_count") != snap.get("sis_prim_count")
                 or prev.get("sis_clients") != snap.get("sis_clients")):
             self.changed.emit("sissocket")
+        # IP Client routes/KPIs read the link state — repaint when it toggles
+        # (rare; datagram TX/RX repaint "ipclient" directly).
+        if (prev.get("connected") != snap.get("connected")
+                or prev.get("running") != snap.get("running")):
+            self.changed.emit("ipclient")
         # File-transfer progress tracks the queue draining, so poll it every tick.
         self._update_ft_progress(snap)
 
@@ -259,6 +313,15 @@ class ConsoleModel(QObject):
                         chat=(sap == CHAT_SAP and not is_file))
         if is_file:
             self._handle_ft_rx(updu, src, sap)
+            return
+        if sap == HMTP_SAP:
+            self._handle_mail_rx(updu, src)
+            return
+        if sap == HFPOP_SAP:
+            self._handle_pop_rx(updu, src)
+            return
+        if sap == IP_SAP:
+            self._handle_ip_rx(updu, src)
             return
         if sap != CHAT_SAP:
             return
@@ -338,6 +401,219 @@ class ConsoleModel(QObject):
                         size=f"{len(payload)} B", result="OK",
                         detail=f"SAP {CHAT_SAP} → node {remote} · {len(payload)} oct", chat=True)
 
+    # ===================================================== Annex F clients (F6)
+    # HF Mail (HMTP SAP 3 / HFPOP SAP 4) and IP Client (SAP 9). The real
+    # ``annex_f`` clients drive the wire format; a ``_ClientNode`` routes their
+    # TX through ``controller.send_unidata`` and their RX decode runs on the GUI
+    # thread from ``on_rx`` (so their callbacks never touch the tick thread).
+    def _ensure_clients(self) -> None:
+        if self.controller is None or self._client_node is not None:
+            return
+        from src.annex_f.hf_pop3 import HFPOP3Client
+        from src.annex_f.hmtp import HMTPClient, HMTPServer
+        from src.annex_f.ip_client import IPClient
+
+        local = self.controller.local_id
+        remote = self.controller.remote_id
+        self._client_node = _ClientNode(self.controller)
+        table = {f"10.66.0.{local}": local, f"10.66.0.{remote}": remote}
+        self._ip = IPClient(self._client_node, address_table=table)
+        self._ip.on_ip_received = self._on_ip_received
+        self._hmtp = HMTPClient(self._client_node)
+        self._hfpop = HFPOP3Client(self._client_node)
+        self._hfpop.on_message_retrieved = self._on_pop_message
+        # RX-only parser: a swallow node keeps it from replying on the wire.
+        self._hmtp_server = HMTPServer(_ClientNode())
+        self._hmtp_server.on_mail_received = self._on_mail_received
+
+    def _mail_ident(self) -> tuple:
+        """(sender, hostname) for outbound HMTP, derived from this node."""
+        host = self.node["callsign"].lower() + ".s5066"
+        return f"watch@{host}", host
+
+    # ---- HF Mail: submit (HMTP), poll (HFPOP), RX parse ----
+    def _submit_mail_live(self) -> None:
+        self._ensure_clients()
+        from src.annex_f.hmtp import MailMessage
+        c = self.compose
+        to = c["to"] or "(no recipient)"
+        subj = c["subj"] or "(no subject)"
+        body = c["body"] or ""
+        remote = self.controller.remote_id
+        sender, host = self._mail_ident()
+        data_body = f"Subject: {subj}\r\n\r\n{body}"
+        try:
+            self._hmtp.send_batch(remote, host, [MailMessage(sender, [to], data_body)],
+                                  priority=6)
+            self.live_tx += 1
+        except Exception as exc:
+            self.live_rejected += 1
+            self._log_event("S_UNIDATA_REQUEST_REJECTED", sap=HMTP_SAP, src="local",
+                            result="ERROR", detail=f"HMTP submit: {exc}")
+            self.mail_folder = "sent"
+            self.changed.emit("mail")
+            return
+        size = _fmt_size(len(data_body.encode("utf-8", "replace")))
+        self.live_sent.insert(0, {
+            "id": f"m{self.mail_seq}", "to": to, "subj": subj, "time": _now()[:5],
+            "size": size, "status": "SENT", "conf": "HMTP · ARQ", "pct": 100,
+            "mime": "text/plain", "body": body})
+        self.mail_seq += 1
+        self._log_event("S_UNIDATA_REQUEST", sap=HMTP_SAP, src="local", dst=f"·{remote:03d}",
+                        size=size, result="OK",
+                        detail=f"HMTP submit → node {remote} · {to}")
+        self.compose["subj"] = ""
+        self.compose["body"] = ""
+        self.mail_folder = "sent"
+        self.mail_sel = 0
+        self.changed.emit("mail")
+
+    def _poll_hfpop_live(self) -> None:
+        self._ensure_clients()
+        remote = self.controller.remote_id
+        try:
+            self._hfpop.retrieve(remote)   # RETR — pede as mensagens ao par
+            self.live_tx += 1
+            self._log_event("S_UNIDATA_REQUEST", sap=HFPOP_SAP, src="local",
+                            dst=f"·{remote:03d}", result="OK",
+                            detail=f"HFPOP RETR → node {remote}")
+        except Exception as exc:
+            self.live_rejected += 1
+            self._log_event("S_UNIDATA_REQUEST_REJECTED", sap=HFPOP_SAP, src="local",
+                            result="ERROR", detail=f"HFPOP: {exc}")
+        self.mail_folder = "inbox"
+        self.mail_sel = 0
+        self.changed.emit("mail")
+
+    def _handle_mail_rx(self, raw: bytes, src: int) -> None:
+        """Inbound HMTP submission (SAP 3): parse into a mail-object."""
+        self._ensure_clients()
+        try:
+            self._hmtp_server._on_data_received(src, raw)   # → _on_mail_received
+        except Exception:
+            pass
+        self.changed.emit("mail")
+
+    def _handle_pop_rx(self, raw: bytes, src: int) -> None:
+        """Inbound HFPOP data (SAP 4): a server reply → retrieved messages."""
+        self._ensure_clients()
+        try:
+            self._hfpop._on_data_received(src, raw)   # → _on_pop_message (if RETR body)
+        except Exception:
+            pass
+        self.changed.emit("mail")
+
+    def _on_mail_received(self, msg) -> None:
+        subj, body = self._split_subject(msg.body)
+        src_email = msg.sender or "unknown@peer.s5066"
+        who = src_email.split("@")[-1].split(".")[0].upper() or "PEER"
+        self.live_inbox.insert(0, {
+            "id": f"rx{len(self.live_inbox)}", "from": who, "addr": src_email,
+            "node": "—", "subj": subj or "(no subject)", "time": _now()[:5],
+            "size": _fmt_size(len(msg.body.encode("utf-8", "replace"))),
+            "unread": True, "mime": "text/plain", "body": body})
+
+    def _on_pop_message(self, msg_number: int, body: str) -> None:
+        subj, text = self._split_subject(body)
+        self.live_inbox.insert(0, {
+            "id": f"pop{len(self.live_inbox)}", "from": "MAILDROP",
+            "addr": "hfpop@peer.s5066", "node": "—",
+            "subj": subj or f"Message {msg_number}", "time": _now()[:5],
+            "size": _fmt_size(len(body.encode("utf-8", "replace"))),
+            "unread": True, "mime": "text/plain", "body": text})
+
+    @staticmethod
+    def _split_subject(raw: str) -> tuple:
+        """Split an RFC-822-ish body into (subject, body); tolerant of \\r\\n / \\n."""
+        text = (raw or "").replace("\r\n", "\n")
+        subj = ""
+        lines = text.split("\n")
+        i = 0
+        while i < len(lines) and lines[i].strip():
+            if lines[i].lower().startswith("subject:"):
+                subj = lines[i].split(":", 1)[1].strip()
+            i += 1
+        body = "\n".join(lines[i + 1:]) if i < len(lines) else ""
+        return subj, (body or text).strip()
+
+    # ---- IP Client (SAP 9): craft/send a test datagram, RX decode ----
+    def send_ip_test(self) -> None:
+        """Send a minimal IPv4 datagram to the peer via the Annex F IP client."""
+        if not (self.live and self.controller is not None and self.controller.running):
+            return
+        self._ensure_clients()
+        local = self.controller.local_id
+        remote = self.controller.remote_id
+        dst_ip = f"10.66.0.{remote}"
+        datagram = self._make_ip_datagram(local, remote, b"PING from Subnet Console")
+        info = self._parse_ip(datagram)
+        ok = False
+        try:
+            ok = self._ip.send_ip_datagram(datagram)   # unicast → ARQ (SAP 9)
+        except Exception:
+            ok = False
+        if ok:
+            self.ip_tx += 1
+            self.live_tx += 1
+            self._log_ip(f"10.66.0.{local}", dst_ip, info, "SENT")
+            self._log_event("S_UNIDATA_REQUEST", sap=IP_SAP, src="local",
+                            dst=f"·{remote:03d}", size=f"{info['length']} B", result="OK",
+                            detail=f"IP {info['proto']} → {dst_ip} · {info['length']} B")
+        else:
+            self.ip_dropped += 1
+            self.live_rejected += 1
+            self._log_ip(f"10.66.0.{local}", dst_ip, info, "DROPPED")
+        self.changed.emit("ipclient")
+
+    def _handle_ip_rx(self, raw: bytes, src: int) -> None:
+        self._ensure_clients()
+        try:
+            self._ip._on_data_received(src, raw)   # valida + → _on_ip_received
+        except Exception:
+            pass
+
+    def _on_ip_received(self, data: bytes, src_addr: int) -> None:
+        self.ip_rx += 1
+        info = self._parse_ip(data)
+        self._log_ip(info["src"], info["dst"], info, "RECV")
+        self.changed.emit("ipclient")
+
+    def _log_ip(self, src_ip: str, dst_ip: str, info: dict, result: str) -> None:
+        mode = "non-ARQ" if info["multicast"] else "ARQ"
+        self.ip_events.insert(0, {
+            "time": time.strftime("%H:%M:%S"), "src": src_ip, "dst": dst_ip,
+            "proto": info["proto"], "len": f"{info['length']} B", "mode": mode,
+            "result": result})
+        del self.ip_events[120:]
+
+    @staticmethod
+    def _make_ip_datagram(local: int, remote: int, payload: bytes) -> bytes:
+        """Craft a minimal valid IPv4 datagram 10.66.0.<local> → 10.66.0.<remote>."""
+        total = 20 + len(payload)
+        h = bytearray(20)
+        h[0] = 0x45                       # version 4, IHL 5 (20 bytes)
+        h[1] = 0x00                       # DSCP/TOS 0 → routine, ARQ (unicast)
+        h[2:4] = total.to_bytes(2, "big")
+        h[6] = 0x00                       # flags/fragment: no DF, offset 0
+        h[8] = 64                         # TTL
+        h[9] = 6                          # protocol: TCP
+        h[12:16] = bytes([10, 66, 0, local & 0xFF])
+        h[16:20] = bytes([10, 66, 0, remote & 0xFF])
+        return bytes(h) + payload
+
+    @staticmethod
+    def _parse_ip(data: bytes) -> dict:
+        """Pull src/dst/proto/length from an IPv4 header for the datagram log."""
+        proto_names = {1: "ICMP", 6: "TCP", 17: "UDP"}
+        if len(data) < 20:
+            return {"src": "—", "dst": "—", "proto": "IP", "length": len(data),
+                    "multicast": False}
+        length = int.from_bytes(data[2:4], "big") or len(data)
+        src = ".".join(str(b) for b in data[12:16])
+        dst = ".".join(str(b) for b in data[16:20])
+        return {"src": src, "dst": dst, "proto": proto_names.get(data[9], str(data[9])),
+                "length": length, "multicast": (data[16] & 0xF0) == 0xE0}
+
     # ------------------------------------------------------------- modem cmd
     def set_modem_ip(self, v: str) -> None:
         self.modem["ip"] = v
@@ -398,6 +674,9 @@ class ConsoleModel(QObject):
         self.changed.emit("mail")
 
     def poll_hfpop(self) -> None:
+        if self.live and self.controller is not None:
+            self._poll_hfpop_live()
+            return
         self.poll_n = min(self.poll_n + 1, 2)
         self.mail_folder = "inbox"
         self.mail_sel = 0
@@ -413,6 +692,9 @@ class ConsoleModel(QObject):
         self.compose["body"] = v
 
     def send_mail(self) -> None:
+        if self.live and self.controller is not None:
+            self._submit_mail_live()
+            return
         c = self.compose
         size = round((len(c["body"]) / 1024 + 0.3) * 10) / 10
         self.outbox.insert(0, {
@@ -983,7 +1265,27 @@ class ConsoleModel(QObject):
         return [{"time": tm, "name": nm, "detail": dt, "color": _prim_color(nm, t)} for tm, nm, dt in raw]
 
     # -------------------------------------------------------------- ip client
+    def _ip_bound(self) -> bool:
+        return bool(self.controller is not None and IP_SAP in self.controller.bound_saps)
+
     def ip_kpis(self) -> list:
+        gd = T.GREEN_DARK
+        if self.live:
+            s = self._live_status
+            connected = bool(s.get("connected"))
+            mtu = getattr(self.controller, "max_user_data_bytes", 128) if self.controller else 128
+            return [
+                {"label": "Datagrams TX", "value": str(self.ip_tx), "unit": "pkt",
+                 "delta": f"SAP 9 · {'ARQ up' if connected else 'no link'}",
+                 "delta_color": gd if connected else T.FG_DIM},
+                {"label": "Datagrams RX", "value": str(self.ip_rx), "unit": "pkt",
+                 "delta": "reassembled" if self.ip_rx else "none yet",
+                 "delta_color": gd if self.ip_rx else T.FG_DIM},
+                {"label": "Dropped", "value": str(self.ip_dropped), "unit": "pkt",
+                 "delta": "no route / MTU", "delta_color": T.RED if self.ip_dropped else T.FG_DIM},
+                {"label": "Link MTU", "value": str(mtu), "unit": "oct",
+                 "delta": "max U-PDU / frame", "delta_color": gd},
+            ]
         return [
             {"label": "Datagrams TX", "value": "5 902", "unit": "pkt", "delta": "1.21 MB"},
             {"label": "Datagrams RX", "value": "1 339", "unit": "pkt", "delta": "402 KB"},
@@ -992,6 +1294,17 @@ class ConsoleModel(QObject):
         ]
 
     def ip_bind(self) -> list:
+        if self.live:
+            local = self.controller.local_id if self.controller is not None else 0
+            remote = self.controller.remote_id if self.controller is not None else 0
+            return [
+                {"k": "HF NODE ADDRESS", "v": self.node["address"]},
+                {"k": "LOCAL IP", "v": f"10.66.0.{local} / 24"},
+                {"k": "PEER IP", "v": f"10.66.0.{remote}"},
+                {"k": "SAP ID", "v": "9 · IP Client · MANDATORY"},
+                {"k": "BINDING", "v": "BOUND · S_BIND_ACCEPT" if self._ip_bound() else "UNBOUND"},
+                {"k": "QoS MODE", "v": "DSCP · DiffServ (Table 9)"},
+            ]
         return [
             {"k": "LAN INTERFACE", "v": "tun0 (point-to-point)"},
             {"k": "LOCAL IP", "v": "10.66.0.1 / 24"},
@@ -1003,19 +1316,31 @@ class ConsoleModel(QObject):
 
     def ip_routes(self) -> list:
         gd, gb = "#1f6e43", "#e3f0e8"
-        raw = [
-            ("10.66.0.6/32", "3.066.000.006", "ARQ", gd, gb, "UP", "CORVUS-06"),
-            ("10.66.0.4/32", "3.066.000.004", "ARQ", gd, gb, "UP", "MERLIN-04"),
-            ("10.66.0.9/32", "3.066.000.009", "ARQ", gd, gb, "DEGRADED", "OSPREY-09"),
-            ("239.0.0.1/32", "broadcast", "non-ARQ ×2", T.FG_MUTED, "#eceef1", "UP", "NET-ALL group"),
-            ("10.66.0.2/32", "3.066.000.002", "ARQ", gd, gb, "DOWN", "HARRIER-02"),
-        ]
+        if self.live:
+            remote = self.controller.remote_id if self.controller is not None else 0
+            connected = bool(self._live_status.get("connected"))
+            running = bool(self._live_status.get("running"))
+            peer_st = "UP" if connected else ("IDLE" if running else "DOWN")
+            raw = [
+                (f"10.66.0.{remote}/32", f"3.066.000.{remote:03d}", "ARQ", gd, gb,
+                 peer_st, f"NODE {remote}"),
+                ("239.0.0.1/32", "broadcast", "non-ARQ ×2", T.FG_MUTED, "#eceef1",
+                 "UP" if running else "DOWN", "NET-ALL group"),
+            ]
+        else:
+            raw = [
+                ("10.66.0.6/32", "3.066.000.006", "ARQ", gd, gb, "UP", "CORVUS-06"),
+                ("10.66.0.4/32", "3.066.000.004", "ARQ", gd, gb, "UP", "MERLIN-04"),
+                ("10.66.0.9/32", "3.066.000.009", "ARQ", gd, gb, "DEGRADED", "OSPREY-09"),
+                ("239.0.0.1/32", "broadcast", "non-ARQ ×2", T.FG_MUTED, "#eceef1", "UP", "NET-ALL group"),
+                ("10.66.0.2/32", "3.066.000.002", "ARQ", gd, gb, "DOWN", "HARRIER-02"),
+            ]
         out = []
         for cidr, node, mode, mfg, mbg, st, links in raw:
             out.append({"cidr": cidr, "node": node, "mode": mode, "mode_fg": mfg, "mode_bg": mbg,
                         "st": st, "links": links,
-                        "st_fg": T.GREEN_DARK if st == "UP" else (T.AMBER if st == "DEGRADED" else T.FG_GHOST2),
-                        "dot": T.GREEN if st == "UP" else (T.AMBER if st == "DEGRADED" else T.RED)})
+                        "st_fg": T.GREEN_DARK if st == "UP" else (T.AMBER if st in ("DEGRADED", "IDLE") else T.FG_GHOST2),
+                        "dot": T.GREEN if st == "UP" else (T.AMBER if st in ("DEGRADED", "IDLE") else T.RED)})
         return out
 
     def ip_qos(self) -> list:
@@ -1032,6 +1357,14 @@ class ConsoleModel(QObject):
 
     def ip_log(self) -> list:
         a = self.theme.accent
+        if self.live:
+            out = []
+            for e in self.ip_events:
+                ok = e["result"] in ("SENT", "RECV", "CONFIRMED")
+                out.append({**e,
+                            "proto_color": T.AMBER if e["proto"] == "ICMP" else (T.PURPLE if e["proto"] == "UDP" else a),
+                            "res_color": T.GREEN_DARK if ok else (T.AMBER if e["result"] == "QUEUED" else T.RED)})
+            return out
         raw = [
             ("14:22:03.901", "10.66.0.1", "10.66.0.6", "TCP", "1280 B", "ARQ", "CONFIRMED"),
             ("14:22:01.550", "10.66.0.6", "10.66.0.1", "TCP", "1280 B", "ARQ", "RECV"),
@@ -1471,6 +1804,12 @@ class ConsoleModel(QObject):
              "body": "All SAPs nominal. 3 clients bound. No faults to report."},
         ]
         outbox = self.outbox
+        # Fatia 6 (live): as caixas passam a ser o tráfego HMTP/HFPOP real — inbox
+        # são os mail-objects recebidos, sent os submetidos por este nó.
+        if self.live:
+            inbox = list(self.live_inbox)
+            sent = list(self.live_sent)
+            outbox = list(self.live_outbox)
         unread = len([m for m in inbox if m["unread"]])
         queued_kb = f"{sum(float(o['size'].split()[0]) for o in outbox):.1f}" if outbox else "0.0"
 

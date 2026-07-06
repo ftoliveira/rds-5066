@@ -25,16 +25,23 @@ def _mini_toggle(on: bool, accent: str) -> QWidget:
 
 
 class IpClientScreen(Screen):
-    topics = set()
+    topics = {"ipclient"}
 
     def build(self, lay: QVBoxLayout) -> None:
         m = self.model
         a = self.accent
         badges = [C.lbl("SAP 9", size=11, mono=True, weight=600, color="#fff", bg=a, radius=4, pad=(2, 8)),
                   C.lbl("MANDATORY", size=10, mono=True, weight=600, color="#fff", bg="#5a5e64", radius=4, pad=(2, 7))]
+        if m.live:
+            bound = m._ip_bound()
+            right = C.row(C.status_text("BOUND · S_BIND_ACCEPT" if bound else "UNBOUND"),
+                          C.button("Send Test Datagram", kind="primary", accent=a,
+                                   on_click=m.send_ip_test), spacing=8)
+        else:
+            right = C.status_text("BOUND · S_BIND_ACCEPT")
         lay.addWidget(C.page_header(
             "IP Client", "IPv4 datagram transport over the HF subnetwork · Annex F.12",
-            badges=badges, right=C.status_text("BOUND · S_BIND_ACCEPT")))
+            badges=badges, right=right))
         lay.addWidget(C.kpi_strip(m.ip_kpis(), 4))
 
         r1 = QHBoxLayout()

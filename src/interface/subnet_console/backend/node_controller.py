@@ -50,7 +50,7 @@ class NodeController(QObject):
 
     def __init__(self, local_id: int, remote_id: int, host: str, port: int,
                  *, bitrate: int = 2400, interleaver: str = "long",
-                 bound_saps=(3, 5, 6, 7), max_user_data_bytes: int = 128,
+                 bound_saps=(3, 4, 5, 6, 7, 9), max_user_data_bytes: int = 128,
                  sis_host: str = "127.0.0.1", sis_port: int = 5066,
                  sis_max_clients: int = 16,
                  parent: Optional[QObject] = None):
