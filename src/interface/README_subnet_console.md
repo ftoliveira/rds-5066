@@ -211,3 +211,10 @@ ficheiro, servidor SIS): **`src/interface/chat_app_110d.py`**.
   *queued connection*). Leituras de estado acontecem na GUI via `QTimer` (500 ms). Nunca
   ler/alterar widgets a partir da thread do nó.
 - O relógio do *status bar* é UTC ao vivo (QTimer 1 s).
+- **Rebuild sob o cursor:** um `ClickableFrame` cujo clique dispara `changed(<tópico>)`
+  reconstrói o próprio ecrã — e o `QScrollArea.setWidget()` apagaria o widget clicado a
+  meio do seu `mouseReleaseEvent` (crash `wrapped C/C++ object … has been deleted`). Por
+  isso `Screen.rebuild` destaca o conteúdo antigo com `takeWidget()` + `deleteLater()`
+  (deleção diferida) e o `ClickableFrame` corre o handler base **antes** de emitir, deixando
+  `clicked.emit()` por último. Ao ligar novos controlos clicáveis que repintam o ecrã, conte
+  com este padrão (nunca toque em `self` depois de emitir).
