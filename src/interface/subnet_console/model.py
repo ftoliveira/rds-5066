@@ -55,11 +55,18 @@ class ConsoleModel(QObject):
     accent_changed = pyqtSignal()      # accent changed → full restyle
 
     def __init__(self, node: str = "A", accent: str = DEFAULT_ACCENT,
-                 modem_host: Optional[str] = None, modem_port: Optional[str] = None):
+                 modem_host: Optional[str] = None, modem_port: Optional[str] = None,
+                 controller=None):
         super().__init__()
         self.theme = Theme(accent)
         prof = NODE_PROFILES.get(node.upper(), NODE_PROFILES["A"])
         self.screen = "dashboard"
+
+        # Fase 2: quando um NodeController está ligado, o modelo opera em modo
+        # "live" e os accessors ligados devolvem estado real em vez de demo.
+        self.controller = controller
+        self.live = controller is not None
+        self._live_status: dict = {"running": False, "connected": False}
 
         self.node = {
             "callsign": prof["callsign"], "address": prof["address"], "station": prof["station"],
@@ -132,6 +139,20 @@ class ConsoleModel(QObject):
         self.theme = Theme(hex_color)
         self.accent_changed.emit()
 
+    # --------------------------------------------------------------- live (F2)
+    def apply_live_status(self, snap: dict) -> None:
+        """Receive a status snapshot from the NodeController (GUI thread).
+
+        Only repaint when a field the UI shows actually changed, so the 500 ms
+        poll doesn't rebuild the Modem pane under the user's cursor.
+        """
+        prev = self._live_status
+        self._live_status = snap
+        keys = ("running", "connected", "rate", "cas", "sis_state", "sis_type",
+                "dts", "arq_state", "reset_pending", "tx_queue")
+        if any(prev.get(k) != snap.get(k) for k in keys):
+            self.changed.emit("modem")
+
     # ------------------------------------------------------------- modem cmd
     def set_modem_ip(self, v: str) -> None:
         self.modem["ip"] = v
@@ -141,13 +162,27 @@ class ConsoleModel(QObject):
 
     def set_modem_rate(self, n: int) -> None:
         self.modem["rate"] = n
+        if self.live and self.controller is not None:
+            self.controller.set_rate(n)
         self.changed.emit("modem")
 
     def set_modem_interleaver(self, v: str) -> None:
         self.modem["interleaver"] = v
+        if self.live and self.controller is not None:
+            self.controller.set_interleaver(v)
         self.changed.emit("modem")
 
     def toggle_modem(self) -> None:
+        if self.live and self.controller is not None:
+            # Connect = build+start the live node; Disconnect = tear it down.
+            if self.controller.running:
+                self.controller.stop()
+            else:
+                self.controller.start(host=self.modem["ip"], port=self.modem["port"],
+                                      bitrate=self.modem["rate"],
+                                      interleaver=self.modem["interleaver"])
+            self.changed.emit("modem")
+            return
         self.modem["linked"] = not self.modem["linked"]
         self.changed.emit("modem")
 
@@ -716,11 +751,27 @@ class ConsoleModel(QObject):
         ]
         for il in ils:
             il["active"] = m["interleaver"] == il["v"]
-        stat = ({"label": "LINKED", "fg": T.GREEN_DARK, "bg": T.GREEN_BG, "border": T.GREEN_BORDER,
+
+        green = {"label": "LINKED", "fg": T.GREEN_DARK, "bg": T.GREEN_BG, "border": T.GREEN_BORDER,
                  "dot": T.GREEN, "halo": T.GREEN_HALO}
-                if linked else
-                {"label": "OFFLINE", "fg": T.RED_DARK, "bg": T.RED_BG, "border": T.RED_BORDER,
-                 "dot": T.RED, "halo": "#f0cfc9"})
+        amber = {"label": "CONNECTING", "fg": T.AMBER, "bg": T.AMBER_BG, "border": "#e3cfa0",
+                 "dot": T.AMBER, "halo": "#f0e2c0"}
+        red = {"label": "OFFLINE", "fg": T.RED_DARK, "bg": T.RED_BG, "border": T.RED_BORDER,
+               "dot": T.RED, "halo": "#f0cfc9"}
+
+        if self.live:
+            ls = self._live_status
+            running = bool(ls.get("running"))
+            connected = bool(ls.get("connected"))
+            rate = int(ls.get("rate") or m["rate"])
+            stat = green if connected else (amber if running else red)
+            return {"ip": m["ip"], "port": m["port"], "rate": rate, "linked": connected,
+                    "rate_label": f"{rate} bps", "rates": rates, "ils": ils, "stat": stat,
+                    "top_label": "MODEM LINKED" if connected else ("MODEM CONNECTING" if running else "MODEM OFFLINE"),
+                    "btn_label": "Disconnect" if running else "Connect Modem",
+                    "btn_bg": T.RED if running else t.accent}
+
+        stat = green if linked else red
         return {"ip": m["ip"], "port": m["port"], "rate": m["rate"], "linked": linked,
                 "rate_label": f"{m['rate']} bps", "rates": rates, "ils": ils, "stat": stat,
                 "top_label": "MODEM LINKED" if linked else "MODEM OFFLINE",

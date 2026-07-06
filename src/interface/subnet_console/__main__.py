@@ -26,9 +26,15 @@ def main() -> int:
                    help="accent colour theme")
     p.add_argument("--modem-host", default=None, help="modem IP for the Modem Link pane")
     p.add_argument("--modem-port", default=None, help="modem TCP port")
+    p.add_argument("--live", action="store_true",
+                   help="drive a real STANAG 5066 node (110D Appendix A/TCP) instead of demo data")
+    p.add_argument("--bitrate", type=int, default=2400, help="initial data rate (bps) in --live mode")
+    p.add_argument("--interleaver", default="long", choices=["short", "long"],
+                   help="initial interleaver in --live mode")
     args = p.parse_args()
     return run(node=args.node, accent=T.ACCENT_OPTIONS[args.accent],
-               modem_host=args.modem_host, modem_port=args.modem_port)
+               modem_host=args.modem_host, modem_port=args.modem_port,
+               live=args.live, bitrate=args.bitrate, interleaver=args.interleaver)
 
 
 if __name__ == "__main__":
