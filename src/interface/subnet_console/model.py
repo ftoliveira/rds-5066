@@ -32,6 +32,10 @@ CHAT_SAP = 5   # HFCHAT Orderwire (Annex F.7)
 SAP_NAMES = {1: "COSS", 2: "T-MMHS (S4406E)", 3: "HMTP", 4: "HFPOP",
              5: "HFCHAT Orderwire", 6: "RCOP", 7: "UDOP", 9: "IP Client"}
 
+# HFCHAT (SAP 5) subnetwork service requirements — Annex F.7.3 point-to-point
+# default: ARQ + NODE DELIVERY + IN-ORDER, priority 4, rank 15.
+CHAT_CFG_DEFAULT = {"arq": True, "confirm": "node", "in_order": True, "priority": 4, "rank": 15}
+
 
 def _now() -> str:
     return time.strftime("%H:%M:%S")
@@ -90,6 +94,11 @@ class ConsoleModel(QObject):
         self.live_tx = 0                    # U-PDUs enviados (S_UNIDATA_REQUEST)
         self.live_rx = 0                    # U-PDUs recebidos (S_UNIDATA_INDICATION)
         self.live_rejected = 0             # envios rejeitados pelo SIS
+
+        # HFCHAT service requirements: `chat_cfg` é o aplicado (usado no envio),
+        # `chat_cfg_draft` é o editável no ecrã Configuration até "Apply".
+        self.chat_cfg = dict(CHAT_CFG_DEFAULT)
+        self.chat_cfg_draft = dict(CHAT_CFG_DEFAULT)
 
         self.node = {
             "callsign": prof["callsign"], "address": prof["address"], "station": prof["station"],
@@ -274,12 +283,20 @@ class ConsoleModel(QObject):
                             detail=f"SAP {CHAT_SAP} → node {self.controller.remote_id}", chat=True)
         self.changed.emit("chat")
 
-    def _send_chat_live(self, text: str) -> None:
+    def _chat_delivery_mode(self):
+        """Build the S_UNIDATA DeliveryMode from the applied HFCHAT config."""
         from src.stypes import DeliveryMode  # lazy: keeps demo mode backend-free
+        c = self.chat_cfg
+        return DeliveryMode(arq_mode=bool(c["arq"]), in_order=bool(c["in_order"]),
+                            node_delivery_confirm=(c["confirm"] == "node"),
+                            client_delivery_confirm=(c["confirm"] == "client"))
+
+    def _send_chat_live(self, text: str) -> None:
         payload = text.encode("ascii", "replace") + b"\r\n"
         try:
             self.controller.send_unidata(CHAT_SAP, CHAT_SAP, payload,
-                                         priority=4, mode=DeliveryMode(arq_mode=True))
+                                         priority=int(self.chat_cfg["priority"]),
+                                         mode=self._chat_delivery_mode())
         except Exception as exc:
             self.live_rejected += 1
             self._log_event("S_UNIDATA_REQUEST_REJECTED", sap=CHAT_SAP, src="local",
@@ -424,6 +441,42 @@ class ConsoleModel(QObject):
     # -------------------------------------------------------------- misc cmd
     def set_cfg_tab(self, tab: str) -> None:
         self.cfg_tab = tab
+        self.changed.emit("config")
+
+    # ---- HFCHAT service requirements (config screen, chat tab) ----
+    def set_chat_arq(self, arq: bool) -> None:
+        self.chat_cfg_draft["arq"] = bool(arq)
+        self.changed.emit("config")
+
+    def set_chat_priority(self, n: int) -> None:
+        self.chat_cfg_draft["priority"] = int(n)
+        self.changed.emit("config")
+
+    def toggle_chat_in_order(self) -> None:
+        self.chat_cfg_draft["in_order"] = not self.chat_cfg_draft["in_order"]
+        self.changed.emit("config")
+
+    def cycle_chat_confirm(self) -> None:
+        order = ["none", "node", "client"]
+        i = order.index(self.chat_cfg_draft["confirm"])
+        self.chat_cfg_draft["confirm"] = order[(i + 1) % len(order)]
+        self.changed.emit("config")
+
+    def apply_chat_cfg(self) -> None:
+        """Commit the HFCHAT draft; subsequent sends use these requirements."""
+        self.chat_cfg = dict(self.chat_cfg_draft)
+        if self.live:
+            c = self.chat_cfg
+            deliv = {"none": "no-confirm", "node": "NODE", "client": "CLIENT"}[c["confirm"]]
+            self._log_event("S_BIND_REQUEST", sap=CHAT_SAP, src="local", result="OK",
+                            detail=f"HFCHAT: {'ARQ' if c['arq'] else 'non-ARQ'} · {deliv} · "
+                                   f"pri {c['priority']}{' · in-order' if c['in_order'] else ''}",
+                            chat=True)
+        self.changed.emit("config")
+        self.changed.emit("chat")   # header reflects the applied mode
+
+    def revert_chat_cfg(self) -> None:
+        self.chat_cfg_draft = dict(self.chat_cfg)
         self.changed.emit("config")
 
     def set_draft(self, v: str) -> None:
@@ -697,9 +750,14 @@ class ConsoleModel(QObject):
         if self.live:
             remote = self.controller.remote_id if self.controller is not None else 0
             up = self.chat_link_up
+            c = self.chat_cfg
+            deliv = {"none": "NO CONFIRM", "node": "NODE DELIVERY",
+                     "client": "CLIENT DELIVERY"}[c["confirm"]]
+            sub = (f"3.066.000.{remote:03d} · SAP 5 · {'ARQ' if c['arq'] else 'non-ARQ'} / {deliv}"
+                   + (" · IN-ORDER" if c["in_order"] else ""))
             return {
                 "live": True, "init": f"N{remote}", "name": f"NODE {remote}",
-                "sub": f"3.066.000.{remote:03d} · Point-to-point · SAP 5 · ARQ / NODE DELIVERY",
+                "sub": sub,
                 "link_up": up,
                 "status_label": "HARD LINK UP" if up else "NO HARD LINK",
                 "status_fg": T.GREEN_DARK if up else T.FG_GHOST2,
@@ -1011,22 +1069,31 @@ class ConsoleModel(QObject):
     def config_view(self) -> dict:
         a = self.theme.accent
         tab = self.cfg_tab
-        data = {
-            "chat": {"sap": "5", "rank": 15, "arq": True, "deliv": "NODE DELIVERY", "pri": 4,
+        meta = {
+            "chat": {"sap": "5",
                      "title": "HFCHAT Orderwire — Subnetwork Service Requirements",
                      "subtitle": "SAP ID 5 · point-to-point default per Annex F.7.3",
                      "note": "Annex F: HFCHAT clients MAY bind using Rank = 15. Point-to-point default "
                      "is ARQ + NODE DELIVERY + IN-ORDER. Point-to-multipoint uses non-ARQ with a "
                      "configurable repeat count and NO delivery confirmation."},
-            "ip": {"sap": "9", "rank": 8, "arq": True, "deliv": "NODE DELIVERY", "pri": 6,
+            "ip": {"sap": "9", "rank": 8, "arq": True, "deliv": "NODE DELIVERY", "pri": 6, "in_order": True,
                    "title": "IP Client — Subnetwork Service Requirements",
                    "subtitle": "SAP ID 9 · MANDATORY · QoS-mapped delivery per Annex F.12",
                    "note": "Annex F: the IP client MUST be able to override default service type and "
                    "set delivery mode per datagram. Unicast → ARQ; multicast → non-ARQ. QoS labels map "
                    "to traffic priority. Rank = 15 discouraged unless performing subnet management."},
         }[tab]
+        if tab == "chat":
+            c = self.chat_cfg_draft
+            deliv = {"none": "NO CONFIRMATION", "node": "NODE DELIVERY",
+                     "client": "CLIENT DELIVERY"}[c["confirm"]]
+            data = {**meta, "rank": c["rank"], "arq": c["arq"], "deliv": deliv,
+                    "pri": c["priority"], "in_order": c["in_order"]}
+        else:
+            data = meta
         prios = [{"n": n, "on": n == data["pri"]} for n in (0, 4, 6, 12, 15)]
-        return {"tab": tab, "accent": a, "prios": prios, "rank_pct": f"{data['rank'] / 15 * 100}%", **data}
+        return {"tab": tab, "accent": a, "prios": prios, "rank_pct": f"{data['rank'] / 15 * 100}%",
+                "editable": tab == "chat", "dirty": self.chat_cfg != self.chat_cfg_draft, **data}
 
     # ------------------------------------------------------------------ modem
     def modem_view(self) -> dict:

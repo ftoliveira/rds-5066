@@ -122,6 +122,70 @@ def test_hfchat_live_end_to_end(qapp):
         qapp.processEvents()
 
 
+def test_modem_starts_disconnected(qapp):
+    """Um console live arranca OFFLINE — só liga em Connect Modem (nunca .start())."""
+    ctrl = NodeController(1, 2, "127.0.0.1", 3000)
+    model = ConsoleModel(node="A", controller=ctrl)
+    assert model.live and not ctrl.running
+    mv = model.modem_view()
+    assert mv["top_label"] == "MODEM OFFLINE" and mv["btn_label"] == "Connect Modem"
+    assert model.statusbar_view()["sis_label"] == "SIS OFFLINE"
+
+
+def test_hfchat_config_wires_send(qapp):
+    """As configurações HFCHAT (Config) alimentam os argumentos do S_UNIDATA."""
+    air = MockAir(keepalive_period=2.0).start()
+    ctrl_a = NodeController(1, 2, "127.0.0.1", air.modem_a.port)
+    ctrl_b = NodeController(2, 1, "127.0.0.1", air.modem_b.port)
+    model_a = ConsoleModel(node="A", controller=ctrl_a)
+    model_b = ConsoleModel(node="B", controller=ctrl_b)
+    _wire(ctrl_a, model_a)
+    _wire(ctrl_b, model_b)
+    try:
+        ctrl_a.start()
+        ctrl_b.start()
+        assert _pump(qapp, lambda: model_a._live_status.get("connected")
+                     and model_b._live_status.get("connected"), 10.0)
+
+        # Edita o rascunho: non-ARQ · prio 6 · sem in-order · CLIENT DELIVERY.
+        model_a.set_chat_arq(False)
+        model_a.set_chat_priority(6)
+        model_a.toggle_chat_in_order()
+        model_a.cycle_chat_confirm()
+        assert model_a.config_view()["dirty"] is True
+        assert model_a.chat_cfg["arq"] is True          # rascunho não afeta o envio
+
+        # Espia os argumentos que o modelo passa ao nó.
+        captured: dict = {}
+        real = ctrl_a.send_unidata
+
+        def spy(sap, dest_sap, payload, **kw):
+            captured.update(kw)
+            real(sap, dest_sap, payload, **kw)
+
+        ctrl_a.send_unidata = spy
+
+        model_a.apply_chat_cfg()
+        assert model_a.config_view()["dirty"] is False
+        model_a.set_draft("param check")
+        model_a.send_msg()
+
+        assert captured["priority"] == 6
+        dm = captured["mode"]
+        assert dm.arq_mode is False and dm.in_order is False
+        assert dm.client_delivery_confirm is True and dm.node_delivery_confirm is False
+
+        # Non-ARQ ainda entrega ponta a ponta ao nó B.
+        assert _pump(qapp, lambda: any(m["dir"] == "in" for m in model_b.live_messages), 20.0), \
+            "mensagem non-ARQ não chegou ao nó B"
+        assert model_b.live_messages[-1]["text"] == "param check"
+    finally:
+        ctrl_a.stop()
+        ctrl_b.stop()
+        air.stop()
+        qapp.processEvents()
+
+
 def test_demo_chat_unaffected(qapp):
     """Sem controller o modelo continua em modo demo (seam intacto)."""
     model = ConsoleModel(node="A")

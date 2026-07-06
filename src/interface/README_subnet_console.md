@@ -86,7 +86,13 @@ Opções de linha de comando:
 | SIS CLIENTS | **File Transfer** (RCOP 6 / UDOP 7) | compositor, fila, log de primitivas | demo |
 | SIS CLIENTS | **Raw SIS Socket** (F.16) | parâmetros, clientes ligados, *wire log* | demo |
 | SETUP | **Modem Link** (110C no design / 110D real) | ligação, taxa, interleaver | **✅ live** |
-| SETUP | **Configuration** | servidor SIS, requisitos de serviço por cliente | demo |
+| SETUP | **Configuration** | servidor SIS; requisitos HFCHAT (ARQ/prio/in-order/confirm) ligados ao envio | **✅ HFCHAT live** |
+
+> **Modo LIVE arranca DESCONECTADO:** o painel Modem mostra OFFLINE e liga-se com
+> **Connect Modem** (o botão arranca o `NodeController`). No separador **Configuration →
+> HFCHAT · SAP 5**, os controlos Transmission Mode (ARQ/non-ARQ), Delivery Confirmation,
+> Deliver In Order e Traffic Priority editam um *rascunho*; **Apply && Rebind** confirma-o e
+> os envios HFCHAT seguintes usam esses argumentos no `S_UNIDATA_REQUEST`; **Revert** descarta.
 
 ## 4. Arquitetura
 

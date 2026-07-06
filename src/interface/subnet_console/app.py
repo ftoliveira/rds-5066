@@ -54,7 +54,8 @@ def run(node: str = "A", accent: str = T.DEFAULT_ACCENT,
         model.modem.update(ip=controller.host, port=str(controller.port),
                            rate=bitrate, interleaver=interleaver.upper())
         app.aboutToQuit.connect(controller.stop)
-        controller.start()   # auto-conecta ao arrancar (como o estado "linked" do demo)
+        # Arranca DESCONECTADO: o painel Modem mostra OFFLINE e o utilizador liga
+        # com "Connect Modem" (model.toggle_modem → controller.start).
 
     win = SubnetConsoleWindow(model)
     win.show()

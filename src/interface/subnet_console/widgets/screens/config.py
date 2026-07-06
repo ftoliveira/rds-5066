@@ -69,19 +69,24 @@ class ConfigScreen(Screen):
         grid = QGridLayout()
         grid.setHorizontalSpacing(28)
         grid.setVerticalSpacing(16)
+        ed = cv["editable"]   # only the HFCHAT tab is wired to live send params
         grid.addWidget(self._labeled("SAP ID", self._readbox(cv["sap"])), 0, 0)
         grid.addWidget(self._rank_field(cv), 0, 1)
-        grid.addWidget(self._labeled("Transmission Mode", self._segment(cv["arq"])), 1, 0)
-        grid.addWidget(self._labeled("Delivery Confirmation", self._deliv(cv["deliv"])), 1, 1)
-        grid.addWidget(self._labeled("Deliver In Order", self._toggle_row("IN-ORDER DELIVERY")), 2, 0)
-        grid.addWidget(self._labeled("Traffic Priority", self._prios(cv["prios"])), 2, 1)
+        grid.addWidget(self._labeled("Transmission Mode", self._segment(cv["arq"], ed)), 1, 0)
+        grid.addWidget(self._labeled("Delivery Confirmation", self._deliv(cv["deliv"], ed)), 1, 1)
+        grid.addWidget(self._labeled("Deliver In Order",
+                                     self._toggle_row("IN-ORDER DELIVERY", cv["in_order"], ed)), 2, 0)
+        grid.addWidget(self._labeled("Traffic Priority", self._prios(cv["prios"], ed)), 2, 1)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         fl.addLayout(grid)
 
         note = self._note(cv["note"])
         fl.addWidget(note)
-        actions = C.row(None, C.button("Revert"), C.button("Apply && Rebind", kind="primary", accent=a), spacing=9)
+        revert = C.button("Revert", on_click=self.model.revert_chat_cfg if ed else None)
+        apply_btn = C.button("Apply && Rebind", kind="primary", accent=a,
+                             on_click=self.model.apply_chat_cfg if ed else None)
+        actions = C.row(None, revert, apply_btn, spacing=9)
         actions.setContentsMargins(0, 18, 0, 0)
         fl.addWidget(actions)
         card.add(form)
@@ -148,40 +153,48 @@ class ConfigScreen(Screen):
         lay.addWidget(trackbar, max(1, round((100 - pct) * 10)), Qt.AlignmentFlag.AlignVCenter)
         return w
 
-    def _segment(self, arq: bool) -> QWidget:
-        a = self.accent
-        f = C.ClickableFrame(base_css="QFrame{background:transparent;border:1px solid %s;border-radius:5px;}"
-                             % T.INPUT_BORDER, cursor=False)
+    def _segment(self, arq: bool, editable: bool = False) -> QWidget:
+        f = C.scoped(QFrame(), "background:transparent;border:1px solid %s;border-radius:5px;" % T.INPUT_BORDER)
         l = QHBoxLayout(f)
         l.setContentsMargins(0, 0, 0, 0)
         l.setSpacing(0)
-        left = C.lbl("ARQ", size=12, weight=600, color="#fff" if arq else T.FG_DIM,
-                     bg=a if arq else "#fff", align="c")
-        left.setContentsMargins(0, 8, 0, 8)
-        right = C.lbl("Non-ARQ", size=12, weight=500 if arq else 600, color=T.FG_DIM if arq else "#fff",
-                      bg="#fff" if arq else a, align="c")
-        right.setContentsMargins(0, 8, 0, 8)
-        l.addWidget(left, 1)
+        l.addWidget(self._seg_half("ARQ", arq, editable, lambda: self.model.set_chat_arq(True)), 1)
         l.addWidget(C.vline(T.INPUT_BORDER, 34))
-        l.addWidget(right, 1)
+        l.addWidget(self._seg_half("Non-ARQ", not arq, editable, lambda: self.model.set_chat_arq(False)), 1)
         return f
 
-    def _deliv(self, value) -> QWidget:
+    def _seg_half(self, text, active, editable, cb) -> QWidget:
+        a = self.accent
+        f = C.ClickableFrame(base_css="QFrame{background:%s;border:none;}" % (a if active else "#fff"),
+                             cursor=editable)
+        l = QHBoxLayout(f)
+        l.setContentsMargins(0, 8, 0, 8)
+        l.addWidget(C.lbl(text, size=12, weight=600 if active else 500,
+                          color="#fff" if active else T.FG_DIM, align="c"), 1)
+        if editable:
+            f.clicked.connect(cb)
+        return f
+
+    def _deliv(self, value, editable: bool = False) -> QWidget:
         f = C.ClickableFrame(base_css="QFrame{background:%s;border:1px solid %s;border-radius:5px;}"
-                             % (T.INPUT_BG, T.INPUT_BORDER), cursor=False)
+                             % (T.INPUT_BG, T.INPUT_BORDER), cursor=editable)
         l = QHBoxLayout(f)
         l.setContentsMargins(11, 8, 11, 8)
         l.addWidget(C.lbl(value, size=12.5, color="#25282c"))
         l.addStretch(1)
         l.addWidget(C.lbl("▼", size=10, color=T.FG_GHOST2))
+        if editable:
+            f.clicked.connect(self.model.cycle_chat_confirm)
         return f
 
-    def _toggle_row(self, label) -> QWidget:
-        return C.row(self._toggle(True), C.lbl(label, size=12.5, color="#25282c"), None, spacing=9)
+    def _toggle_row(self, label, on: bool = True, editable: bool = False) -> QWidget:
+        return C.row(self._toggle(on, editable), C.lbl(label, size=12.5, color="#25282c"), None, spacing=9)
 
-    def _toggle(self, on: bool) -> QWidget:
+    def _toggle(self, on: bool, editable: bool = False) -> QWidget:
         a = self.accent
-        track = C.scoped(QFrame(), f"background:{a if on else '#c4c6cb'};border-radius:10px;")
+        track = C.ClickableFrame(
+            base_css="QFrame{background:%s;border-radius:10px;}" % (a if on else "#c4c6cb"),
+            cursor=editable)
         track.setFixedSize(38, 21)
         l = QHBoxLayout(track)
         l.setContentsMargins(2, 2, 2, 2)
@@ -192,9 +205,11 @@ class ConfigScreen(Screen):
         l.addWidget(knob)
         if not on:
             l.addStretch(1)
+        if editable:
+            track.clicked.connect(self.model.toggle_chat_in_order)
         return track
 
-    def _prios(self, prios) -> QWidget:
+    def _prios(self, prios, editable: bool = False) -> QWidget:
         a = self.accent
         w = QWidget()
         l = QHBoxLayout(w)
@@ -202,9 +217,15 @@ class ConfigScreen(Screen):
         l.setSpacing(5)
         for p in prios:
             on = p["on"]
-            chip = C.lbl(str(p["n"]), size=11, mono=True, weight=600,
-                         color="#fff" if on else T.FG_DIM, bg=a if on else "#fff",
-                         border=a if on else T.SIDEBAR_DIV, radius=4, pad=(6, 0), align="c")
+            chip = C.ClickableFrame(
+                base_css="QFrame{background:%s;border:1px solid %s;border-radius:4px;}"
+                         % (a if on else "#fff", a if on else T.SIDEBAR_DIV), cursor=editable)
+            cl = QHBoxLayout(chip)
+            cl.setContentsMargins(6, 4, 6, 4)
+            cl.addWidget(C.lbl(str(p["n"]), size=11, mono=True, weight=600,
+                               color="#fff" if on else T.FG_DIM, align="c"), 1)
+            if editable:
+                chip.clicked.connect(lambda n=p["n"]: self.model.set_chat_priority(n))
             l.addWidget(chip, 1)
         return w
 
