@@ -16,7 +16,7 @@ def _sap_badge(sap: str, bg: str) -> QWidget:
 
 
 class DashboardScreen(Screen):
-    topics = set()  # static demo data; only accent triggers a rebuild
+    topics = {"dashboard"}  # live: rebuilds on status/event; demo: only accent
 
     def build(self, lay: QVBoxLayout) -> None:
         m = self.model
@@ -49,11 +49,13 @@ class DashboardScreen(Screen):
         lay.addLayout(r2)
 
     def _links_card(self) -> C.Card:
+        links = self.model.links()
         card = C.Card("Active Links & Peers",
-                      right=C.lbl("4 nodes", size=11, mono=True, color=T.FG_DIM))
+                      right=C.lbl(f"{len(links)} node{'s' if len(links) != 1 else ''}",
+                                  size=11, mono=True, color=T.FG_DIM))
         tbl = C.Table([1.4, 1, 0.9, 0.9, 0.9, 1])
         tbl.header(["Peer", "Address", "Link", "SNR", "Rate", "Uptime"])
-        for l in self.model.links():
+        for l in links:
             peer = C.row(C.dot(l["dot"], 7),
                          C.lbl(l["peer"], size=12.5, weight=600, color="#25282c"), spacing=8)
             tbl.add([
@@ -68,7 +70,8 @@ class DashboardScreen(Screen):
         return card
 
     def _quality_card(self) -> C.Card:
-        card = C.Card("Channel Quality — %s" % self.model.node["activePeer"])
+        meta = self.model.quality_meta()
+        card = C.Card(meta["title"])
         card.setFixedWidth(320)
         body = QVBoxLayout()
         body.setContentsMargins(14, 14, 14, 14)
@@ -79,7 +82,7 @@ class DashboardScreen(Screen):
         grid = QGridLayout()
         grid.setContentsMargins(0, 3, 0, 0)
         grid.setHorizontalSpacing(10)
-        for i, (k, v) in enumerate([("INTERLEAVER", "LONG (4.8s)"), ("ALE STATE", "LINKED")]):
+        for i, (k, v) in enumerate(meta["cells"]):
             cell = QVBoxLayout()
             cell.setSpacing(3)
             cell.addWidget(C.lbl(k, size=10, weight=600, color=T.FG_FAINT, letter_spacing=0.3))
@@ -119,10 +122,8 @@ class DashboardScreen(Screen):
         grid = QGridLayout()
         grid.setContentsMargins(14, 12, 14, 12)
         grid.setHorizontalSpacing(20)
-        for i, (cap, num, unit, sub) in enumerate([
-            ("TX QUEUE", "14", "U-PDUs", "3.2 KB pending · ARQ"),
-            ("RX QUEUE", "2", "U-PDUs", "reassembling 1"),
-        ]):
+        for i, q in enumerate(self.model.queues()):
+            cap, num, unit, sub = q["cap"], q["num"], q["unit"], q["sub"]
             cell = QVBoxLayout()
             cell.setSpacing(2)
             cell.addWidget(C.lbl(cap, size=10, weight=600, color=T.FG_FAINT, letter_spacing=0.4))

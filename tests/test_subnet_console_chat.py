@@ -85,14 +85,36 @@ def test_hfchat_live_end_to_end(qapp):
         assert rx["from"] == "NODE 1"      # src_addr do nó A
         assert rx["conf"] == "RECEIVED"
 
-        # Os dois feeds registaram o caminho SIS.
-        assert any(n == "S_UNIDATA_INDICATION" for _, n, _ in model_b.live_prims)
-        assert any(n == "S_UNIDATA_REQUEST" for _, n, _ in model_a.live_prims)
-        assert any("ESTABLISH_CONFIRM" in n for _, n, _ in model_a.live_prims)
+        # Os dois feeds do chat registaram o caminho SIS (projeção pública).
+        feed_a = [p["name"] for p in model_a.chat_prims()]
+        feed_b = [p["name"] for p in model_b.chat_prims()]
+        assert "S_UNIDATA_INDICATION" in feed_b
+        assert "S_UNIDATA_REQUEST" in feed_a
+        assert any("ESTABLISH_CONFIRM" in n for n in feed_a)
 
         # A thread ao vivo do B alimenta o accessor que o ecrã desenha.
         drawn = model_b.chat_messages()
         assert drawn[-1]["text"] == text and drawn[-1]["align"] == "l"
+
+        # --- Fatia 3: monitor / dashboard / barra de estado ao vivo ---
+        # O event log do monitor mostra a mesma atividade (SAP 5).
+        prims_b = [e["prim"] for e in model_b.event_log()]
+        assert "S_UNIDATA_INDICATION" in prims_b
+        assert model_b.counters()[0]["value"] == str(model_b.live_rx)  # U-PDUs RX
+        assert model_a.counters()[1]["value"] == str(model_a.live_tx)  # U-PDUs TX
+        assert model_a.live_tx >= 1 and model_b.live_rx >= 1
+
+        # SAP table ao vivo: SAP 5 BOUND com contagem de RX no nó B.
+        row5_b = next(r for r in model_b.sap_table() if r["sap"] == "5")
+        assert row5_b["state"] == "BOUND" and int(row5_b["rx"]) >= 1
+        row6_b = next(r for r in model_b.sap_table() if r["sap"] == "6")
+        assert row6_b["state"] == "UNBOUND"
+
+        # KPIs e barra de estado refletem o snapshot de status().
+        assert model_a.dashboard_kpis()[0]["value"] == "UP"          # Modem Link
+        sb = model_a.statusbar_view()
+        assert sb["traffic"] == f"TX {model_a.live_tx} · RX {model_a.live_rx}"
+        assert "LISTENING" in sb["sis_label"]
     finally:
         ctrl_a.stop()
         ctrl_b.stop()

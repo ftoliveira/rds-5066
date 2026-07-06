@@ -78,8 +78,8 @@ Opções de linha de comando:
 
 | Secção | Ecrã | Conteúdo | Ao vivo? |
 |--------|------|----------|:--------:|
-| SECTIONS | **Subnet Dashboard** | KPIs, ligações/peers, qualidade, SAPs, filas TX/RX, S-Primitives | demo |
-| SECTIONS | **Traffic Monitor** | contadores, alocação de SAP (Anexo F Tabela F-1), log de eventos | demo |
+| SECTIONS | **Subnet Dashboard** | KPIs, peer/link, métricas de ligação, SAPs, filas, S-Primitives | **✅ live** |
+| SECTIONS | **Traffic Monitor** | contadores, alocação de SAP (Anexo F Tabela F-1), event log | **✅ live** |
 | SIS CLIENTS | **HFCHAT Orderwire** (SAP 5) | operadores (demo), *thread* + *feed* ao vivo, hard link | **✅ live** |
 | SIS CLIENTS | **HF Mail** (HMTP 3 / HFPOP 4) | caixas, leitura/composição, *pipelining* HMTP | demo |
 | SIS CLIENTS | **IP Client** (SAP 9) | binding, QoS, rotas IP→STANAG, log de datagramas | demo |
@@ -159,9 +159,15 @@ Fatiar por ecrã, sempre verificando *headless* contra `tests/mock_110d_modem`
       `chat_messages()`/`chat_prims()`/`chat_header()` ramificam em `self.live`. Verificado ponta a
       ponta em `tests/test_subnet_console_chat.py` (dois nós via `MockAir`, offscreen). É o que torna
       o `run_110d_real.sh` num teste de chat de ponta a ponta.
-- [ ] **Fatia 3 — Dashboard + Traffic Monitor + status bar**
-      Usar o snapshot de `status()` (CAS/SIS/DTS/ARQ, `tx_queue`); manter um log de
-      eventos S-primitive em memória alimentado pelos sinais e mostrá-lo no monitor.
+- [x] **Fatia 3 — Dashboard + Traffic Monitor + status bar** *(feito)*
+      Log único de eventos S-primitive em memória (`model.live_events`, cap 200) alimentado
+      pelos mesmos sinais da Fatia 2 — é a fonte única do *feed* do chat (`chat_prims`), do
+      *event log* do monitor (`event_log`) e das "recent primitives" do dashboard (`dash_prims`).
+      O snapshot de `status()` (CAS/SIS/DTS/ARQ/`tx_queue`/`arq_window`/`blocking`) passa a
+      alimentar `dashboard_kpis`/`counters`/`quality`/`queues`/`links`/`sap_table` e a barra de
+      estado (`statusbar_view`); contadores `live_tx`/`live_rx`/`live_rejected` agregam o tráfego.
+      `apply_live_status` repinta dashboard/monitor/statusbar quando um campo visível muda; os
+      ecrãs ganharam `topics={"dashboard"}`/`{"monitor"}`. Coberto por `test_subnet_console_chat.py`.
 - [ ] **Fatia 4 — File Transfer (RCOP 6 / UDOP 7)**
       Fatiar ficheiro em chunks com o protocolo `FILE:/FCON:/FEND:/FALL:` (ver
       `chat_app_110d._send_file`), RCOP→ARQ / UDOP→non-ARQ, progresso na fila e log.

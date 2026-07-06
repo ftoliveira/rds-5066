@@ -28,6 +28,10 @@ SCREENS = [
 
 CHAT_SAP = 5   # HFCHAT Orderwire (Annex F.7)
 
+# Annex F Table F-1 client names, keyed by SAP id (subset the console binds/shows).
+SAP_NAMES = {1: "COSS", 2: "T-MMHS (S4406E)", 3: "HMTP", 4: "HFPOP",
+             5: "HFCHAT Orderwire", 6: "RCOP", 7: "UDOP", 9: "IP Client"}
+
 
 def _now() -> str:
     return time.strftime("%H:%M:%S")
@@ -75,11 +79,17 @@ class ConsoleModel(QObject):
         self.live = controller is not None
         self._live_status: dict = {"running": False, "connected": False}
 
-        # Fatia 2 — HFCHAT (SAP 5) ao vivo: a thread e o feed de S-primitives
-        # são alimentados pelos sinais do NodeController (RX, hard link, reject).
+        # Fatia 2/3 — estado ao vivo. A thread do HFCHAT (`live_messages`) e o
+        # log de eventos S-primitive (`live_events`, fonte única do feed do chat,
+        # do event log do monitor e das "recent primitives" do dashboard) são
+        # alimentados pelos sinais do NodeController. As contagens agregam o
+        # snapshot de `status()` nos KPIs/contadores/barra de estado.
         self.chat_link_up = False
         self.live_messages: List[dict] = []
-        self.live_prims: List[tuple] = []   # (hh:mm:ss, prim_name, detail)
+        self.live_events: List[dict] = []   # rich SIS events (newest first)
+        self.live_tx = 0                    # U-PDUs enviados (S_UNIDATA_REQUEST)
+        self.live_rx = 0                    # U-PDUs recebidos (S_UNIDATA_INDICATION)
+        self.live_rejected = 0             # envios rejeitados pelo SIS
 
         self.node = {
             "callsign": prof["callsign"], "address": prof["address"], "station": prof["station"],
@@ -161,50 +171,90 @@ class ConsoleModel(QObject):
         """
         prev = self._live_status
         self._live_status = snap
-        keys = ("running", "connected", "rate", "cas", "sis_state", "sis_type",
-                "dts", "arq_state", "reset_pending", "tx_queue")
+        keys = ("running", "connected", "rate", "blocking", "cas", "sis_state",
+                "sis_type", "dts", "arq_state", "arq_window", "arq_queue",
+                "reset_pending", "tx_queue")
         if any(prev.get(k) != snap.get(k) for k in keys):
-            self.changed.emit("modem")
+            # These four surfaces all read the status snapshot.
+            for topic in ("modem", "dashboard", "monitor", "statusbar"):
+                self.changed.emit(topic)
 
-    # ------------------------------------------------------ chat live (F2/S2)
+    def _bound_sap_count(self) -> int:
+        if self.live and self.controller is not None:
+            return len(self.controller.bound_saps)
+        return 5   # demo
+
+    def _sap_traffic(self) -> tuple:
+        """Per-SAP TX/RX counts and newest activity time from ``live_events``."""
+        tx: dict = {}
+        rx: dict = {}
+        last: dict = {}
+        for e in self.live_events:   # newest first
+            sap = e["sap"]
+            if e["prim"] == "S_UNIDATA_INDICATION":
+                rx[sap] = rx.get(sap, 0) + 1
+            elif e["prim"] == "S_UNIDATA_REQUEST":
+                tx[sap] = tx.get(sap, 0) + 1
+            last.setdefault(sap, e["time"])
+        return tx, rx, last
+
+    # ------------------------------------------------------ live SIS (F2/F3)
     # These slots run on the GUI thread (queued connections from the tick
-    # thread). Each appends to the live thread/feed and repaints the chat.
-    def _add_prim(self, name: str, detail: str) -> None:
-        """Push a synthetic S-primitive to the front of the live feed (cap 64)."""
-        self.live_prims.insert(0, (_now(), name, detail))
-        del self.live_prims[64:]
+    # thread). Each records an event in the single ``live_events`` log and
+    # repaints the affected screens (chat / monitor / dashboard).
+    def _log_event(self, prim: str, *, sap="—", src="—", dst="—", size="—",
+                   result: str = "OK", detail: str = "", chat: bool = False) -> None:
+        """Push a rich SIS event to the front of the live log (cap 200)."""
+        self.live_events.insert(0, {
+            "time": _now(), "prim": prim, "sap": str(sap), "src": src, "dst": dst,
+            "size": size, "result": result, "detail": detail or prim, "chat": chat})
+        del self.live_events[200:]
+        self.changed.emit("monitor")
+        self.changed.emit("dashboard")
 
     def on_rx(self, ind: dict) -> None:
-        """S_UNIDATA_INDICATION — append SAP 5 (HFCHAT) traffic to the thread.
+        """S_UNIDATA_INDICATION — log every SAP; append SAP 5 to the HFCHAT thread.
 
-        Wired to ``NodeController.unidata_received``; other SAPs (IP, files)
-        belong to their own slices and are ignored here.
+        Wired to ``NodeController.unidata_received``. Non-chat SAPs (IP, files)
+        still land in the monitor's event log, but only SAP 5 feeds the thread.
         """
-        if int(ind.get("sap", 0)) != CHAT_SAP:
-            return
-        text = (ind.get("text") or "").rstrip("\r\n")
+        sap = int(ind.get("sap", 0))
         src = int(ind.get("src_addr", 0))
         nbytes = len(ind.get("updu", b"") or b"")
+        self.live_rx += 1
+        self._log_event("S_UNIDATA_INDICATION", sap=sap, src=f"·{src:03d}", dst="local",
+                        size=f"{nbytes} B", result="OK",
+                        detail=f"from node {src} · {nbytes} oct", chat=(sap == CHAT_SAP))
+        if sap != CHAT_SAP:
+            return
+        text = (ind.get("text") or "").rstrip("\r\n")
         self.live_messages.append({
             "dir": "in", "from": f"NODE {src}", "addr": f"·{src:03d}",
             "time": _now(), "text": text, "conf": "RECEIVED"})
-        self._add_prim("S_UNIDATA_INDICATION", f"from node {src} · {nbytes} oct")
         self.changed.emit("chat")
 
     def on_link_up(self, remote_addr: int, remote_sap: int) -> None:
         self.chat_link_up = True
-        self._add_prim("S_HARD_LINK_ESTABLISH_CONFIRM", f"node {remote_addr} · SAP {remote_sap}")
+        self._log_event("S_HARD_LINK_ESTABLISH_CONFIRM", sap=remote_sap, src="local",
+                        dst=f"·{remote_addr:03d}", result="CONFIRMED",
+                        detail=f"node {remote_addr} · SAP {remote_sap}", chat=True)
         self.changed.emit("chat")
 
     def on_link_down(self, remote_addr: int, confirm: bool) -> None:
         self.chat_link_up = False
         name = "S_HARD_LINK_TERMINATE_CONFIRM" if confirm else "S_HARD_LINK_TERMINATED"
-        self._add_prim(name, f"node {remote_addr}")
+        self._log_event(name, sap=CHAT_SAP, src="local", dst=f"·{remote_addr:03d}",
+                        result="CONFIRMED" if confirm else "OK",
+                        detail=f"node {remote_addr}", chat=True)
         self.changed.emit("chat")
 
     def on_rejected(self, sap_id: int, reason: str) -> None:
-        self._add_prim("S_UNIDATA_REQUEST_REJECTED", f"SAP {sap_id} · {reason}")
-        self.changed.emit("chat")
+        self.live_rejected += 1
+        self._log_event("S_UNIDATA_REQUEST_REJECTED", sap=sap_id, src="local",
+                        result=reason, detail=f"SAP {sap_id} · {reason}",
+                        chat=(int(sap_id) == CHAT_SAP))
+        if int(sap_id) == CHAT_SAP:
+            self.changed.emit("chat")
 
     def toggle_chat_link(self) -> None:
         """Establish / terminate the SAP 5 hard link to the configured peer."""
@@ -214,11 +264,14 @@ class ConsoleModel(QObject):
             return
         if self.chat_link_up:
             self.controller.hard_link_terminate(CHAT_SAP)
-            self._add_prim("S_HARD_LINK_TERMINATE_REQUEST", f"SAP {CHAT_SAP}")
+            self._log_event("S_HARD_LINK_TERMINATE_REQUEST", sap=CHAT_SAP, src="local",
+                            dst=f"node {self.controller.remote_id}",
+                            result="PENDING", detail=f"SAP {CHAT_SAP}", chat=True)
         else:
             self.controller.hard_link_establish(CHAT_SAP, CHAT_SAP)
-            self._add_prim("S_HARD_LINK_ESTABLISH_REQUEST",
-                           f"SAP {CHAT_SAP} → node {self.controller.remote_id}")
+            self._log_event("S_HARD_LINK_ESTABLISH_REQUEST", sap=CHAT_SAP, src="local",
+                            dst=f"node {self.controller.remote_id}", result="PENDING",
+                            detail=f"SAP {CHAT_SAP} → node {self.controller.remote_id}", chat=True)
         self.changed.emit("chat")
 
     def _send_chat_live(self, text: str) -> None:
@@ -228,14 +281,19 @@ class ConsoleModel(QObject):
             self.controller.send_unidata(CHAT_SAP, CHAT_SAP, payload,
                                          priority=4, mode=DeliveryMode(arq_mode=True))
         except Exception as exc:
-            self._add_prim("S_UNIDATA_REQUEST_REJECTED", f"send failed: {exc}")
+            self.live_rejected += 1
+            self._log_event("S_UNIDATA_REQUEST_REJECTED", sap=CHAT_SAP, src="local",
+                            result="ERROR", detail=f"send failed: {exc}", chat=True)
             return
+        self.live_tx += 1
+        remote = self.controller.remote_id
         self.live_messages.append({
             "dir": "out", "from": self.node["callsign"],
             "addr": "·" + self.node["address"].split(".")[-1],
             "time": _now(), "text": text, "conf": "SENT · ARQ"})
-        self._add_prim("S_UNIDATA_REQUEST",
-                       f"SAP {CHAT_SAP} → node {self.controller.remote_id} · {len(payload)} oct")
+        self._log_event("S_UNIDATA_REQUEST", sap=CHAT_SAP, src="local", dst=f"·{remote:03d}",
+                        size=f"{len(payload)} B", result="OK",
+                        detail=f"SAP {CHAT_SAP} → node {remote} · {len(payload)} oct", chat=True)
 
     # ------------------------------------------------------------- modem cmd
     def set_modem_ip(self, v: str) -> None:
@@ -389,6 +447,22 @@ class ConsoleModel(QObject):
 
     def dashboard_kpis(self) -> list:
         gd = T.GREEN_DARK
+        if self.live:
+            s = self._live_status
+            connected = bool(s.get("connected"))
+            rate = int(s.get("rate") or 0)
+            return [
+                {"label": "Modem Link", "value": "UP" if connected else "DOWN",
+                 "unit": "bps" if connected else "", "delta": f"CAS {s.get('cas', 'IDLE')}",
+                 "delta_color": gd if connected else T.RED},
+                {"label": "Hard Link SAP 5", "value": "1" if self.chat_link_up else "0",
+                 "unit": "link", "delta": s.get("sis_state", "IDLE")},
+                {"label": "TX Queue", "value": str(int(s.get("tx_queue") or 0)), "unit": "U-PDUs",
+                 "delta": f"ARQ {s.get('arq_state', '-')}", "delta_color": gd},
+                {"label": "U-PDUs", "value": str(self.live_rx), "unit": "rx",
+                 "delta": f"{self.live_tx} tx · {self.live_rejected} rej",
+                 "delta_color": T.RED if self.live_rejected else gd},
+            ]
         return [
             {"label": "Active Links", "value": "3", "unit": "peers", "delta": "2 hard · 1 soft"},
             {"label": "Throughput", "value": "1.92", "unit": "kb/s", "delta": "↑ 14% last 60s", "delta_color": gd},
@@ -398,6 +472,20 @@ class ConsoleModel(QObject):
 
     def links(self) -> list:
         g, gd, gb = T.GREEN, T.GREEN_DARK, T.GREEN_BG
+        if self.live:
+            s = self._live_status
+            remote = self.controller.remote_id if self.controller is not None else 0
+            connected = bool(s.get("connected"))
+            rate = str(int(s.get("rate") or 0))
+            if self.chat_link_up:
+                typ, tfg, tbg, dotc = "HARD", "#1f6e43", gb, g
+            elif connected:
+                typ, tfg, tbg, dotc = "SOFT", T.FG_MUTED, "#eceef1", T.AMBER
+            else:
+                typ, tfg, tbg, dotc = "IDLE", T.RED_DARK, T.RED_BG, T.RED
+            return [{"peer": f"NODE {remote}", "address": f"3.066.000.{remote:03d}", "type": typ,
+                     "snr": "—", "rate": rate if connected else "—", "uptime": "—",
+                     "dot": dotc, "snr_color": T.FG_GHOST2, "type_fg": tfg, "type_bg": tbg}]
         return [
             {"peer": "CORVUS-06", "address": "3.066.000.006", "type": "HARD", "snr": "+18", "rate": "2400",
              "uptime": "01:24:18", "dot": g, "snr_color": gd, "type_fg": "#1f6e43", "type_bg": gb},
@@ -410,11 +498,58 @@ class ConsoleModel(QObject):
         ]
 
     def quality(self) -> list:
+        if self.live:
+            s = self._live_status
+            a = self.theme.accent
+            rate = int(s.get("rate") or 0)
+            blocking = int(s.get("blocking") or 0)
+            txq = int(s.get("tx_queue") or 0)
+            win = int(s.get("arq_window") or 0)
+
+            def pct(x, mx):
+                return f"{max(0, min(100, round(x / mx * 100)))}%"
+
+            # Real link-layer metrics (we don't measure SNR/BER off the modem).
+            return [
+                {"label": "Modem Data Rate", "value": f"{rate} bps", "pct": pct(rate, 4800), "color": T.GREEN},
+                {"label": "Blocking Factor", "value": str(blocking), "pct": pct(blocking, 1200), "color": a},
+                {"label": "TX Queue Depth", "value": f"{txq} U-PDU", "pct": pct(txq, 32),
+                 "color": T.AMBER if txq else T.GREEN},
+                {"label": "ARQ TX Window", "value": f"{win} frames", "pct": pct(win, 16), "color": a},
+            ]
         return [
             {"label": "Signal-to-Noise (SNR)", "value": "+18 dB", "pct": "82%", "color": T.GREEN},
             {"label": "Bit Error Rate", "value": "1.2e-4", "pct": "20%", "color": T.GREEN},
             {"label": "Channel Utilisation", "value": "64 %", "pct": "64%", "color": self.theme.accent},
             {"label": "Doppler / Multipath", "value": "Low", "pct": "24%", "color": T.GREEN},
+        ]
+
+    def quality_meta(self) -> dict:
+        """Title + the two footer cells of the dashboard quality card."""
+        if self.live:
+            remote = self.controller.remote_id if self.controller is not None else 0
+            connected = bool(self._live_status.get("connected"))
+            return {"title": f"Link Metrics — NODE {remote}",
+                    "cells": [("INTERLEAVER", self.modem["interleaver"]),
+                              ("LINK STATE", "CONNECTED" if connected else "OFFLINE")]}
+        return {"title": "Channel Quality — %s" % self.node["activePeer"],
+                "cells": [("INTERLEAVER", "LONG (4.8s)"), ("ALE STATE", "LINKED")]}
+
+    def queues(self) -> list:
+        """Two cells for the dashboard TX/RX queue card."""
+        if self.live:
+            s = self._live_status
+            txq = int(s.get("tx_queue") or 0)
+            arqq = int(s.get("arq_queue") or 0)
+            return [
+                {"cap": "TX QUEUE", "num": str(txq), "unit": "U-PDUs",
+                 "sub": f"ARQ {s.get('arq_state', '-')}"},
+                {"cap": "ARQ WINDOW", "num": str(int(s.get("arq_window") or 0)), "unit": "frames",
+                 "sub": f"queue {arqq} · LWE {s.get('arq_lwe', 0)}"},
+            ]
+        return [
+            {"cap": "TX QUEUE", "num": "14", "unit": "U-PDUs", "sub": "3.2 KB pending · ARQ"},
+            {"cap": "RX QUEUE", "num": "2", "unit": "U-PDUs", "sub": "reassembling 1"},
         ]
 
     def bound_saps(self) -> list:
@@ -429,6 +564,9 @@ class ConsoleModel(QObject):
 
     def dash_prims(self) -> list:
         t = self.theme
+        if self.live:
+            return [{"time": e["time"], "name": e["prim"], "sap": e["sap"],
+                     "color": _prim_color(e["prim"], t)} for e in self.live_events[:6]]
         return [
             {"time": "14:22:08", "name": "S_UNIDATA_INDICATION", "sap": "5", "color": _prim_color("S_UNIDATA_INDICATION", t)},
             {"time": "14:22:03", "name": "S_UNIDATA_REQUEST_CONFIRM", "sap": "9", "color": _prim_color("S_UNIDATA_REQUEST_CONFIRM", t)},
@@ -439,6 +577,16 @@ class ConsoleModel(QObject):
     # ---------------------------------------------------------------- monitor
     def counters(self) -> list:
         a = self.theme.accent
+        if self.live:
+            s = self._live_status
+            return [
+                {"label": "U-PDUs RX", "value": str(self.live_rx), "color": T.FG},
+                {"label": "U-PDUs TX", "value": str(self.live_tx), "color": a},
+                {"label": "TX Queue", "value": str(int(s.get("tx_queue") or 0)), "color": a},
+                {"label": "Rejected", "value": str(self.live_rejected),
+                 "color": T.RED if self.live_rejected else T.FG},
+                {"label": "ARQ Window", "value": str(int(s.get("arq_window") or 0)), "color": T.FG},
+            ]
         return [
             {"label": "Total U-PDUs", "value": "8 412", "color": T.FG},
             {"label": "TX / s", "value": "6.1", "color": a},
@@ -447,8 +595,41 @@ class ConsoleModel(QObject):
             {"label": "Avg Latency", "value": "2.4s", "color": T.FG},
         ]
 
-    def sap_table(self) -> list:
+    def _sap_row(self, sap, name, state, rank, pri, mode, tx, rx, last, mand) -> dict:
         t = self.theme
+        bound = state == "BOUND"
+        idle = state in ("UNBOUND", "RESERVED")
+        return {
+            "sap": sap, "name": name, "state": state, "rank": rank, "pri": pri, "mode": mode,
+            "tx": tx, "rx": rx, "last": last,
+            "sap_color": t.sap_color(sap) if bound else T.FG_GHOST2,
+            "name_color": T.FG_GHOST2 if idle else T.FG_BODY,
+            "name_weight": 600 if bound else 400,
+            "row_bg": T.CARD_BG if bound else "#fafafb",
+            "state_fg": T.GREEN_DARK if bound else T.FG_GHOST2,
+            "tag": "MAND" if mand else "OPT",
+            "tag_fg": "#fff" if mand else T.FG_DIM,
+            "tag_bg": "#5a5e64" if mand else "#eceef1",
+        }
+
+    def sap_table(self) -> list:
+        if self.live:
+            bound = set(self.controller.bound_saps) if self.controller is not None else set()
+            txm, rxm, lastm = self._sap_traffic()
+            out = []
+            for sap in (1, 2, 3, 4, 5, 6, 7, 9):
+                sid = str(sap)
+                is_bound = sap in bound
+                if is_bound:
+                    out.append(self._sap_row(
+                        sid, SAP_NAMES.get(sap, "—"), "BOUND", 0,
+                        4 if sap == CHAT_SAP else 6, "ARQ",
+                        str(txm.get(sid, 0)), str(rxm.get(sid, 0)), lastm.get(sid, "—"),
+                        sap == 9))
+                else:
+                    out.append(self._sap_row(sid, SAP_NAMES.get(sap, "—"), "UNBOUND",
+                                             "—", "—", "—", "0", "0", "—", sap == 9))
+            return out
         rows = [
             ("1", "COSS", "UNBOUND", "—", "—", "—", "0", "0", "—", False),
             ("2", "T-MMHS (S4406E)", "UNBOUND", "—", "—", "—", "0", "0", "—", False),
@@ -459,26 +640,20 @@ class ConsoleModel(QObject):
             ("7", "UDOP", "UNBOUND", "—", "—", "—", "0", "0", "—", False),
             ("9", "IP Client", "BOUND", 8, 6, "ARQ/nARQ", "5 902", "1 339", "14:22:03", True),
         ]
-        out = []
-        for sap, name, state, rank, pri, mode, tx, rx, last, mand in rows:
-            bound = state == "BOUND"
-            idle = state in ("UNBOUND", "RESERVED")
-            out.append({
-                "sap": sap, "name": name, "state": state, "rank": rank, "pri": pri, "mode": mode,
-                "tx": tx, "rx": rx, "last": last,
-                "sap_color": t.sap_color(sap) if bound else T.FG_GHOST2,
-                "name_color": T.FG_GHOST2 if idle else T.FG_BODY,
-                "name_weight": 600 if bound else 400,
-                "row_bg": T.CARD_BG if bound else "#fafafb",
-                "state_fg": T.GREEN_DARK if bound else T.FG_GHOST2,
-                "tag": "MAND" if mand else "OPT",
-                "tag_fg": "#fff" if mand else T.FG_DIM,
-                "tag_bg": "#5a5e64" if mand else "#eceef1",
-            })
-        return out
+        return [self._sap_row(*r) for r in rows]
 
     def event_log(self) -> list:
         t = self.theme
+        if self.live:
+            out = []
+            for e in self.live_events:
+                result = e["result"]
+                ok = result in ("OK", "CONFIRMED", "DELIVERED", "RECV", "SENT")
+                out.append({"time": e["time"], "prim": e["prim"], "sap": e["sap"],
+                            "src": e["src"], "dst": e["dst"], "size": e["size"],
+                            "result": result, "color": _prim_color(e["prim"], t),
+                            "res_color": T.GREEN_DARK if ok else (T.AMBER if result == "PENDING" else T.RED)})
+            return out
         raw = [
             ("14:22:08.412", "S_UNIDATA_INDICATION", "5", "·006", "·001", "46 B", "OK"),
             ("14:22:03.901", "S_UNIDATA_REQUEST_CONFIRM", "9", "local", "·006", "1280 B", "CONFIRMED"),
@@ -558,8 +733,9 @@ class ConsoleModel(QObject):
     def chat_prims(self) -> list:
         t = self.theme
         if self.live:
-            return [{"time": tm, "name": nm, "detail": dt, "color": _prim_color(nm, t)}
-                    for tm, nm, dt in self.live_prims]
+            return [{"time": e["time"], "name": e["prim"], "detail": e["detail"],
+                     "color": _prim_color(e["prim"], t)}
+                    for e in self.live_events if e["chat"]][:40]
         raw = [
             ("14:22:02", "S_UNIDATA_REQUEST", "SAP 5 → 3.066.000.006 · 28 oct"),
             ("14:22:00", "S_UNIDATA_REQUEST_CONFIRM", "msg 0x4A2 · NODE DELIVERY"),
@@ -891,6 +1067,30 @@ class ConsoleModel(QObject):
                 "top_label": "MODEM LINKED" if linked else "MODEM OFFLINE",
                 "btn_label": "Disconnect" if linked else "Connect Modem",
                 "btn_bg": T.RED if linked else t.accent}
+
+    # -------------------------------------------------------------- status bar
+    def statusbar_view(self) -> dict:
+        """Dynamic fields for the bottom status bar (SIS/clients/traffic/link)."""
+        if self.live:
+            s = self._live_status
+            running = bool(s.get("running"))
+            connected = bool(s.get("connected"))
+            rate = int(s.get("rate") or 0)
+            return {
+                "sis_label": "SIS 127.0.0.1:5066 LISTENING" if running else "SIS OFFLINE",
+                "sis_dot": T.GREEN if running else T.RED,
+                "clients": f"{self._bound_sap_count()} CLIENTS BOUND",
+                "traffic": f"TX {self.live_tx} · RX {self.live_rx}",
+                "right": f"110D · {rate} bps · {'LINKED' if connected else 'NO LINK'}",
+                "node": f"NODE {self.node['address']}",
+            }
+        n = self.node
+        return {
+            "sis_label": "SIS 127.0.0.1:5066 LISTENING", "sis_dot": T.GREEN,
+            "clients": "5 CLIENTS BOUND", "traffic": "TX 14 · RX 2",
+            "right": f"{n['waveform']} · {n['dataRate']} · SNR {n['snr']}",
+            "node": f"NODE {n['address']}",
+        }
 
     # ------------------------------------------------------------------- mail
     def mail_view(self) -> dict:

@@ -9,7 +9,7 @@ from .base import Screen
 
 
 class MonitorScreen(Screen):
-    topics = set()
+    topics = {"monitor"}   # live: rebuilds on status/event; demo: only accent
 
     def build(self, lay: QVBoxLayout) -> None:
         capturing = C.lbl("● CAPTURING", size=11, mono=True, color=T.GREEN_DARK,
