@@ -36,8 +36,12 @@ def run(node: str = "A", accent: str = T.DEFAULT_ACCENT,
         local_id, remote_id = (1, 2) if is_a else (2, 1)
         host = modem_host or "127.0.0.1"
         port = int(modem_port) if modem_port else (3000 if is_a else 3001)
+        # Raw SIS Socket Server (F.16): node A listens on 5066, node B on 5067
+        # (matches chat_app_110d) so both nodes can run side by side.
+        sis_port = 5066 if is_a else 5067
         controller = NodeController(local_id, remote_id, host, port,
-                                    bitrate=bitrate, interleaver=interleaver)
+                                    bitrate=bitrate, interleaver=interleaver,
+                                    sis_port=sis_port)
 
     model = ConsoleModel(node=node, accent=accent, modem_host=modem_host, modem_port=modem_port,
                          controller=controller)

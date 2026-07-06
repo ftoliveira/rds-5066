@@ -9,16 +9,17 @@ from .base import Screen
 
 
 class SisSocketScreen(Screen):
-    topics = set()
+    topics = {"sissocket"}
 
     def build(self, lay: QVBoxLayout) -> None:
         m = self.model
         badges = [C.lbl("ALL SAPs", size=10, mono=True, weight=600, color="#fff", bg="#5a5e64", radius=4, pad=(2, 7)),
                   C.lbl("MANDATORY", size=10, mono=True, weight=600, color="#fff", bg="#5a5e64", radius=4, pad=(2, 7))]
+        st = m.sk_status()
         lay.addWidget(C.page_header(
             "Raw SIS Socket Server",
             "TCP/IP socket-server providing the physical Subnetwork Interface Sublayer channel · Annex F.16",
-            badges=badges, right=C.status_text("LISTENING · 127.0.0.1:5066")))
+            badges=badges, right=C.status_text(st["label"], color=st["color"], dot_color=st["dot"])))
         lay.addWidget(C.kpi_strip(m.sk_kpis(), 4))
 
         r1 = QHBoxLayout()
@@ -30,8 +31,10 @@ class SisSocketScreen(Screen):
         lay.addWidget(self._wire_card())
 
     def _clients_card(self) -> C.Card:
+        n = len(self.model.sk_clients())
         card = C.Card("Connected Clients",
-                      right=C.lbl("5 sockets open", size=11, mono=True, color=T.FG_DIM))
+                      right=C.lbl(f"{n} socket{'' if n == 1 else 's'} open",
+                                  size=11, mono=True, color=T.FG_DIM))
         tbl = C.Table([0.5, 1.3, 1.6, 0.6, 0.6, 1, 1.2])
         tbl.header(["ID", "Remote Socket", "Client", "SAP", "Rank", "State", "Connected"])
         for c in self.model.sk_clients():

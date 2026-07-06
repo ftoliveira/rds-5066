@@ -198,6 +198,13 @@ class ConsoleModel(QObject):
             # These four surfaces all read the status snapshot.
             for topic in ("modem", "dashboard", "monitor", "statusbar"):
                 self.changed.emit(topic)
+        # Raw SIS Socket screen (F.16): repaint when the server toggles, a client
+        # connects/binds/leaves, or a new primitive crosses the wire.
+        if (prev.get("sis_server_running") != snap.get("sis_server_running")
+                or prev.get("sis_server_port") != snap.get("sis_server_port")
+                or prev.get("sis_prim_count") != snap.get("sis_prim_count")
+                or prev.get("sis_clients") != snap.get("sis_clients")):
+            self.changed.emit("sissocket")
         # File-transfer progress tracks the queue draining, so poll it every tick.
         self._update_ft_progress(snap)
 
@@ -1046,7 +1053,40 @@ class ConsoleModel(QObject):
         return out
 
     # ------------------------------------------------------------ raw sis srv
+    def sk_status(self) -> dict:
+        """Header status: is the F.16 socket server listening, and where."""
+        if self.live:
+            s = self._live_status
+            running = bool(s.get("sis_server_running"))
+            host = s.get("sis_server_host") or self.controller.sis_host
+            port = s.get("sis_server_port")
+            return {"listening": running,
+                    "label": f"LISTENING · {host}:{port}" if running else "SERVER OFFLINE",
+                    "color": T.GREEN_DARK if running else T.RED,
+                    "dot": T.GREEN if running else T.RED}
+        return {"listening": True, "label": "LISTENING · 127.0.0.1:5066",
+                "color": T.GREEN_DARK, "dot": T.GREEN}
+
     def sk_kpis(self) -> list:
+        gd = T.GREEN_DARK
+        if self.live:
+            s = self._live_status
+            clients = s.get("sis_clients") or []
+            bound = sum(1 for c in clients if c["state"] == "BOUND")
+            mx = int(s.get("sis_max_clients") or 16)
+            running = bool(s.get("sis_server_running"))
+            return [
+                {"label": "TCP Connections", "value": str(len(clients)), "unit": f"of {mx}",
+                 "delta": f"{bound} bound · {len(clients) - bound} idle"},
+                {"label": "Primitives", "value": str(int(s.get("sis_prim_count") or 0)),
+                 "unit": "msg", "delta": "req + ind + confirm"},
+                {"label": "Bound Sockets", "value": str(bound), "unit": "SAPs",
+                 "delta": "via Raw SIS" if bound else "none yet",
+                 "delta_color": gd if bound else T.FG_DIM},
+                {"label": "Server", "value": "UP" if running else "DOWN", "unit": "",
+                 "delta": "listening" if running else "offline",
+                 "delta_color": gd if running else T.RED},
+            ]
         return [
             {"label": "TCP Connections", "value": "5", "unit": "of 16", "delta": "4 bound · 1 idle"},
             {"label": "Primitives / s", "value": "11", "unit": "msg", "delta": "req + ind + confirm"},
@@ -1055,6 +1095,18 @@ class ConsoleModel(QObject):
         ]
 
     def sk_server(self) -> list:
+        if self.live:
+            s = self._live_status
+            host = s.get("sis_server_host") or self.controller.sis_host
+            port = s.get("sis_server_port")
+            return [
+                {"k": "BIND ADDRESS", "v": str(host)},
+                {"k": "TCP PORT", "v": str(port) if port else "—"},
+                {"k": "MAX CLIENTS", "v": str(int(s.get("sis_max_clients") or 16))},
+                {"k": "MESSAGE FRAMING", "v": "SIS wrapper (0x90EB)"},
+                {"k": "PROTOCOL", "v": "Annex A.2.2 binary"},
+                {"k": "BYTE ORDER", "v": "big-endian / MSB"},
+            ]
         return [
             {"k": "BIND ADDRESS", "v": "127.0.0.1"},
             {"k": "TCP PORT", "v": "5066"},
@@ -1066,6 +1118,21 @@ class ConsoleModel(QObject):
 
     def sk_clients(self) -> list:
         t = self.theme
+        if self.live:
+            out = []
+            for c in self._live_status.get("sis_clients") or []:
+                bound = c["state"] == "BOUND"
+                sap = c.get("sap")
+                sap_str = str(sap) if sap is not None else "—"
+                name = SAP_NAMES.get(sap, f"SAP {sap}") if bound else "unbound (handshake)"
+                out.append({"id": f"#{c['conn_id']}", "remote": c["remote"], "client": name,
+                            "sap": sap_str, "rank": str(c["rank"]) if bound else "—",
+                            "st": c["state"], "since": c["since"],
+                            "st_fg": T.GREEN_DARK if bound else T.AMBER,
+                            "st_bg": T.GREEN_BG if bound else T.AMBER_BG,
+                            "sap_bg": "#c9ccd1" if sap_str == "—" else t.sap_color(sap_str),
+                            "client_fg": T.FG_BODY if bound else T.FG_DIM})
+            return out
         raw = [
             ("#1", "127.0.0.1:51420", "HFCHAT Orderwire", "5", "15", "BOUND", "12:09:55"),
             ("#4", "127.0.0.1:51902", "HMTP — Mail Submit", "3", "8", "BOUND", "13:58:30"),
@@ -1086,6 +1153,22 @@ class ConsoleModel(QObject):
 
     def sk_wire(self) -> list:
         a = self.theme.accent
+
+        def color(name):
+            if "REJECT" in name:
+                return T.RED
+            if "ACCEPT" in name or "CONFIRM" in name or "AVAIL" in name or "ESTABLISHED" in name:
+                return T.GREEN_DARK
+            return T.FG_BODY
+
+        if self.live:
+            out = []
+            for w in self._live_status.get("sis_wire") or []:
+                out.append({"time": w["time"], "dir": w["dir"], "name": w["name"],
+                            "sap": w["sap"], "size": f"{w['size']} B",
+                            "dir_fg": a if w["dir"] == "C → S" else T.PURPLE,
+                            "color": color(w["name"])})
+            return out
         raw = [
             ("14:22:08.412", "S → C", "S_UNIDATA_INDICATION", "5", "46 B"),
             ("14:22:03.901", "S → C", "S_UNIDATA_REQUEST_CONFIRM", "9", "12 B"),
@@ -1096,13 +1179,9 @@ class ConsoleModel(QObject):
             ("14:20:48.330", "S → C", "S_KEEP_ALIVE", "all", "4 B"),
             ("14:20:05.221", "S → C", "S_UNIDATA_REQUEST_CONFIRM", "5", "12 B"),
         ]
-        out = []
-        for time, direction, name, sap, size in raw:
-            color = T.RED if "REJECT" in name else (
-                T.GREEN_DARK if ("ACCEPT" in name or "CONFIRM" in name or "AVAIL" in name) else T.FG_BODY)
-            out.append({"time": time, "dir": direction, "name": name, "sap": sap, "size": size,
-                        "dir_fg": a if direction == "C → S" else T.PURPLE, "color": color})
-        return out
+        return [{"time": tm, "dir": d, "name": nm, "sap": sap, "size": sz,
+                 "dir_fg": a if d == "C → S" else T.PURPLE, "color": color(nm)}
+                for tm, d, nm, sap, sz in raw]
 
     # ------------------------------------------------------------- file xfer
     @property

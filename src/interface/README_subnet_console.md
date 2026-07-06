@@ -84,7 +84,7 @@ Opções de linha de comando:
 | SIS CLIENTS | **HF Mail** (HMTP 3 / HFPOP 4) | caixas, leitura/composição, *pipelining* HMTP | demo |
 | SIS CLIENTS | **IP Client** (SAP 9) | binding, QoS, rotas IP→STANAG, log de datagramas | demo |
 | SIS CLIENTS | **File Transfer** (RCOP 6 / UDOP 7) | chunking FILE/FCON/FEND/FALL, envio, RX+reassembly, progresso | **✅ live** |
-| SIS CLIENTS | **Raw SIS Socket** (F.16) | parâmetros, clientes ligados, *wire log* | demo |
+| SIS CLIENTS | **Raw SIS Socket** (F.16) | parâmetros, clientes ligados, *wire log* | **✅ live** |
 | SETUP | **Modem Link** (110C no design / 110D real) | ligação, taxa, interleaver | **✅ live** |
 | SETUP | **Configuration** | servidor SIS; requisitos HFCHAT (ARQ/prio/in-order/confirm) ligados ao envio | **✅ HFCHAT live** |
 
@@ -93,6 +93,11 @@ Opções de linha de comando:
 > HFCHAT · SAP 5**, os controlos Transmission Mode (ARQ/non-ARQ), Delivery Confirmation,
 > Deliver In Order e Traffic Priority editam um *rascunho*; **Apply && Rebind** confirma-o e
 > os envios HFCHAT seguintes usam esses argumentos no `S_UNIDATA_REQUEST`; **Revert** descarta.
+>
+> **Raw SIS Socket (F.16):** o servidor de socket TCP arranca/pára junto do nó (com o
+> **Connect/Disconnect Modem**) em `127.0.0.1:5066` (nó A) / `:5067` (nó B). Clientes SIS
+> externos podem então ligar-se e fazer bind de SAPs por TCP; o ecrã **Raw SIS Socket** mostra
+> os clientes ligados e o *wire log* ao vivo. Até ligar o modem o ecrã mostra **SERVER OFFLINE**.
 
 ## 4. Arquitetura
 
@@ -104,7 +109,8 @@ subnet_console/
 ├── model.py           # ConsoleModel — estado + dados demo + sinais + seam live
 ├── window.py          # SubnetConsoleWindow (frameless): chrome + QStackedWidget
 ├── backend/
-│   └── node_controller.py  # NodeController — nó STANAG 5066 real atrás de sinais Qt
+│   ├── node_controller.py  # NodeController — nó STANAG 5066 real atrás de sinais Qt
+│   └── sis_server.py       # InstrumentedSisServer — RawSisSocketServer + wire log/roster
 └── widgets/
     ├── common.py      # primitivas reutilizáveis (Card, KpiTile, Table, pill, …)
     ├── titlebar/menubar/toolbar/sidebar/statusbar.py   # chrome
@@ -146,8 +152,11 @@ estado na thread da GUI. Já expõe **tudo** o que as próximas fatias precisam:
 
 **`status()` → dict:** `running, connected, rate, blocking, cas, sis_state, sis_type,
 dts, arq_state, arq_window, arq_unacked, arq_queue, arq_lwe, arq_uwe, reset_pending,
-tx_queue`. (`arq_unacked` = frames em voo ainda não confirmados — o progresso de ficheiros
-usa-o para a fila drenar a zero. SAPs ligados por omissão: `(3, 5, 6, 7)`.)
+tx_queue`, e (Fatia 5) `sis_server_running, sis_server_host, sis_server_port,
+sis_max_clients, sis_clients, sis_wire, sis_prim_count`. (`arq_unacked` = frames em voo
+ainda não confirmados — o progresso de ficheiros usa-o para a fila drenar a zero. SAPs
+ligados por omissão: `(3, 5, 6, 7)`. O Raw SIS Socket Server arranca junto do nó em
+`start()` e fecha em `stop()`.)
 
 ## 6. Estado e roteiro da Fase 2 (atividades)
 
@@ -186,9 +195,21 @@ Fatiar por ecrã, sempre verificando *headless* contra `tests/mock_110d_modem`
       reassembla (`_handle_ft_rx` → `ft_received`), mostrando o ficheiro recebido na fila e o
       log RCOP/UDOP (`ft_events`). Verificado ponta a ponta (UDOP e RCOP c/ hard link) em
       `tests/test_subnet_console_filexfer.py`.
-- [ ] **Fatia 5 — Raw SIS Socket (F.16)**
-      Correr `RawSisSocketServer(node, "127.0.0.1", 5066/5067)` num loop asyncio em
-      thread própria (ver `chat_app_110d._start_sis_api`); listar clientes/wire log reais.
+- [x] **Fatia 5 — Raw SIS Socket (F.16)** *(feito)*
+      `backend/sis_server.py` traz `InstrumentedSisServer` (subclasse de
+      `RawSisSocketServer`) que grava o *wire log* (ambas as direções, via os *hooks*
+      `_dispatch_primitive`/`_send_raw`) e o *roster* de clientes TCP (socket remoto, SAP
+      ligado, rank, hora de ligação). O `NodeController.start()` arranca-o num loop asyncio
+      em thread própria (`_start_sis_server`, espelha `chat_app_110d._start_sis_api`) em
+      `127.0.0.1:5066` (nó A) / `5067` (nó B) — `sis_port=0` dá porta efémera nos testes; o
+      `stop()` fecha-o limpo (evento + `server.stop()`). O snapshot de `status()` ganha
+      `sis_server_running/host/port`, `sis_clients`, `sis_wire`, `sis_prim_count`;
+      `apply_live_status` repinta `sissocket` quando o servidor liga/desliga, um cliente
+      liga/faz bind/sai, ou uma primitiva nova cruza o fio. Os accessors
+      `sk_status/sk_kpis/sk_server/sk_clients/sk_wire` ramificam em `self.live`. *Thread-safety*
+      sem *locks*: `deque.append` + `list(...)` e cópias atómicas de dict (ver docstring do
+      módulo). Verificado ponta a ponta (cliente TCP real → bind SAP 9 → aparece na consola +
+      wire log) em `tests/test_subnet_console_sissocket.py`.
 - [ ] **Fatia 6 — IP Client (SAP 9) + HF Mail (HMTP 3/HFPOP 4)**
       Ligar os clientes `annex_f/*` (`ip_client`, `hmtp`, `hf_pop3`); maior esforço,
       menor prioridade.
@@ -219,6 +240,16 @@ ficheiro, servidor SIS): **`src/interface/chat_app_110d.py`**.
   os callbacks SIS correm nessa thread e **só** emitem sinais Qt (entregues à GUI por
   *queued connection*). Leituras de estado acontecem na GUI via `QTimer` (500 ms). Nunca
   ler/alterar widgets a partir da thread do nó.
+- **Raw SIS Socket Server (F.16):** corre num **segundo** thread daemon — um `asyncio` *event
+  loop* próprio (`NodeController._start_sis_server`/`_sis_main`, espelha
+  `chat_app_110d._start_sis_api`), separado do thread de tick. A paragem é limpa via um
+  `threading.Event` (`_sis_thread_stop`) que desbloqueia o `run_in_executor` e deixa o
+  `finally` correr `await server.stop()`. Porta 0 = efémera (testes); a real lê-se de
+  `server._server.sockets[0].getsockname()`. O `InstrumentedSisServer` observa o servidor
+  **sem locks**: o *wire log* é um `deque` (append no thread asyncio, `list(...)` na GUI, ambos
+  atómicos no CPython) e o *roster* de clientes usa `list(self._connections.items())` (uma só
+  chamada C, sem soltar o GIL); o mapa de horas de ligação só é tocado na GUI. Como o servidor
+  liga assincronamente, o ecrã só passa a **LISTENING** no poll seguinte (~500 ms após Connect).
 - O relógio do *status bar* é UTC ao vivo (QTimer 1 s).
 - **Rebuild sob o cursor:** um `ClickableFrame` cujo clique dispara `changed(<tópico>)`
   reconstrói o próprio ecrã — e o `QScrollArea.setWidget()` apagaria o widget clicado a

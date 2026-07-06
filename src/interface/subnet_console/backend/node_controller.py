@@ -16,6 +16,7 @@ Threading model (mirrors chat_app_110d):
 """
 from __future__ import annotations
 
+import asyncio
 import threading
 import time
 from typing import Optional
@@ -26,6 +27,8 @@ from src.cas import CasConfig
 from src.modem.tcp_110d_adapter import Tcp110dConfig, Tcp110dModemAdapter
 from src.stanag_node import StanagNode
 from src.stypes import DeliveryMode
+
+from .sis_server import InstrumentedSisServer
 
 TICK_PERIOD_S = 0.2
 STATUS_POLL_MS = 500
@@ -48,6 +51,8 @@ class NodeController(QObject):
     def __init__(self, local_id: int, remote_id: int, host: str, port: int,
                  *, bitrate: int = 2400, interleaver: str = "long",
                  bound_saps=(3, 5, 6, 7), max_user_data_bytes: int = 128,
+                 sis_host: str = "127.0.0.1", sis_port: int = 5066,
+                 sis_max_clients: int = 16,
                  parent: Optional[QObject] = None):
         super().__init__(parent)
         self.local_id = local_id
@@ -63,6 +68,18 @@ class NodeController(QObject):
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._pending_break = False
+
+        # Raw SIS Socket Server (F.16) — started alongside the node, on its own
+        # asyncio loop/thread (mirrors chat_app_110d._start_sis_api).
+        self.sis_host = sis_host
+        self.sis_port = int(sis_port)
+        self.sis_max_clients = int(sis_max_clients)
+        self.sis_server: Optional[InstrumentedSisServer] = None
+        self._sis_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._sis_thread: Optional[threading.Thread] = None
+        self._sis_thread_stop: Optional[threading.Event] = None
+        self.sis_actual_host: Optional[str] = None
+        self.sis_actual_port: Optional[int] = None
 
         self._poll = QTimer(self)
         self._poll.setInterval(STATUS_POLL_MS)
@@ -118,12 +135,14 @@ class NodeController(QObject):
         self._pending_break = False
         self._thread = threading.Thread(target=self._loop, name="s5066-tick", daemon=True)
         self._thread.start()
+        self._start_sis_server()
         self._poll.start()
         self._emit_status()
 
     def stop(self) -> None:
         """Stop ticking and tear the node/adapter down. No-op if not running."""
         self._poll.stop()
+        self._stop_sis_server()
         self._stop.set()
         node = self.node
         self.node = None
@@ -136,6 +155,71 @@ class NodeController(QObject):
             self._thread.join(timeout=2.0)
         self._thread = None
         self._emit_status()
+
+    # -------------------------------------------------- Raw SIS Socket (F.16)
+    def _start_sis_server(self) -> None:
+        """Start the Raw SIS Socket Server in an asyncio loop on its own thread.
+
+        Mirrors ``chat_app_110d._start_sis_api``: external SIS clients can then
+        bind SAPs over TCP. Port 0 binds an ephemeral port (used by tests); the
+        actual bound port is read back in :meth:`_sis_main`.
+        """
+        if self._sis_loop is not None or self.node is None:
+            return
+        self.sis_server = InstrumentedSisServer(
+            self.node, host=self.sis_host, port=self.sis_port,
+            max_connections=self.sis_max_clients)
+        self.sis_actual_host = None
+        self.sis_actual_port = None
+        self._sis_thread_stop = threading.Event()
+        self._sis_loop = asyncio.new_event_loop()
+        self._sis_thread = threading.Thread(target=self._run_sis_loop,
+                                            name="s5066-sis", daemon=True)
+        self._sis_thread.start()
+
+    def _run_sis_loop(self) -> None:
+        loop = self._sis_loop
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._sis_main())
+        except Exception as exc:  # pragma: no cover - defensive
+            self.node_error.emit(f"sis server: {exc}")
+        finally:
+            loop.close()
+
+    async def _sis_main(self) -> None:
+        server = self.sis_server
+        try:
+            await server.start()
+            addr = server._server.sockets[0].getsockname()
+            self.sis_actual_host, self.sis_actual_port = addr[0], int(addr[1])
+            # Keep the loop alive until stop() releases the event.
+            await asyncio.get_event_loop().run_in_executor(
+                None, self._sis_thread_stop.wait)
+        finally:
+            await server.stop()
+
+    def _stop_sis_server(self) -> None:
+        """Signal the SIS loop to finish and tear the server down."""
+        if self._sis_loop is None:
+            return
+        # Setting the event unblocks the run_in_executor wait in _sis_main, whose
+        # `finally` awaits server.stop(); the loop then completes on its own. The
+        # no-op callback just nudges the loop to notice promptly.
+        if self._sis_thread_stop is not None:
+            self._sis_thread_stop.set()
+        try:
+            self._sis_loop.call_soon_threadsafe(lambda: None)
+        except RuntimeError:
+            pass
+        if self._sis_thread is not None:
+            self._sis_thread.join(timeout=3.0)
+        self._sis_loop = None
+        self._sis_thread = None
+        self._sis_thread_stop = None
+        self.sis_server = None
+        self.sis_actual_host = None
+        self.sis_actual_port = None
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -209,12 +293,15 @@ class NodeController(QObject):
         """Best-effort snapshot of live node state (read on the GUI thread)."""
         node = self.node
         if node is None:
-            return {"running": False, "connected": False, "rate": self.bitrate}
+            off = {"running": False, "connected": False, "rate": self.bitrate}
+            off.update(self._sis_status())
+            return off
         snap = {"running": True, "connected": False, "rate": self.bitrate,
                 "blocking": 0, "cas": "IDLE", "sis_state": "IDLE", "sis_type": "-",
                 "dts": "-", "arq_state": "-", "arq_window": 0, "arq_unacked": 0,
                 "arq_queue": 0, "arq_lwe": 0, "arq_uwe": 0, "reset_pending": False,
                 "tx_queue": 0}
+        snap.update(self._sis_status())
         try:
             m = node.modem
             snap["connected"] = bool(getattr(m, "is_connected", False))
@@ -255,6 +342,23 @@ class NodeController(QObject):
         except Exception:
             pass
         return snap
+
+    def _sis_status(self) -> dict:
+        """SIS-server fields for the status snapshot (F.16 screen)."""
+        srv = self.sis_server
+        if srv is None or self.sis_actual_port is None:
+            return {"sis_server_running": False, "sis_server_host": self.sis_host,
+                    "sis_server_port": None, "sis_max_clients": self.sis_max_clients,
+                    "sis_clients": [], "sis_wire": [], "sis_prim_count": 0}
+        return {
+            "sis_server_running": True,
+            "sis_server_host": self.sis_actual_host,
+            "sis_server_port": self.sis_actual_port,
+            "sis_max_clients": self.sis_max_clients,
+            "sis_clients": srv.client_rows(),
+            "sis_wire": srv.wire_rows(),
+            "sis_prim_count": srv.prim_count,
+        }
 
     def _emit_status(self) -> None:
         self.status_changed.emit(self.status())
