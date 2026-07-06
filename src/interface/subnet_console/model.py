@@ -13,6 +13,7 @@ they never yank focus out of a field mid-type.
 """
 from __future__ import annotations
 
+import time
 from typing import List, Optional
 
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -24,6 +25,12 @@ SCREENS = [
     "dashboard", "monitor", "chat", "mail",
     "ipclient", "filexfer", "sissocket", "modem", "config",
 ]
+
+CHAT_SAP = 5   # HFCHAT Orderwire (Annex F.7)
+
+
+def _now() -> str:
+    return time.strftime("%H:%M:%S")
 
 NODE_PROFILES = {
     "A": {"callsign": "FALCON-01", "address": "3.066.000.001", "station": "HQ Node — Lisbon",
@@ -67,6 +74,12 @@ class ConsoleModel(QObject):
         self.controller = controller
         self.live = controller is not None
         self._live_status: dict = {"running": False, "connected": False}
+
+        # Fatia 2 — HFCHAT (SAP 5) ao vivo: a thread e o feed de S-primitives
+        # são alimentados pelos sinais do NodeController (RX, hard link, reject).
+        self.chat_link_up = False
+        self.live_messages: List[dict] = []
+        self.live_prims: List[tuple] = []   # (hh:mm:ss, prim_name, detail)
 
         self.node = {
             "callsign": prof["callsign"], "address": prof["address"], "station": prof["station"],
@@ -152,6 +165,77 @@ class ConsoleModel(QObject):
                 "dts", "arq_state", "reset_pending", "tx_queue")
         if any(prev.get(k) != snap.get(k) for k in keys):
             self.changed.emit("modem")
+
+    # ------------------------------------------------------ chat live (F2/S2)
+    # These slots run on the GUI thread (queued connections from the tick
+    # thread). Each appends to the live thread/feed and repaints the chat.
+    def _add_prim(self, name: str, detail: str) -> None:
+        """Push a synthetic S-primitive to the front of the live feed (cap 64)."""
+        self.live_prims.insert(0, (_now(), name, detail))
+        del self.live_prims[64:]
+
+    def on_rx(self, ind: dict) -> None:
+        """S_UNIDATA_INDICATION — append SAP 5 (HFCHAT) traffic to the thread.
+
+        Wired to ``NodeController.unidata_received``; other SAPs (IP, files)
+        belong to their own slices and are ignored here.
+        """
+        if int(ind.get("sap", 0)) != CHAT_SAP:
+            return
+        text = (ind.get("text") or "").rstrip("\r\n")
+        src = int(ind.get("src_addr", 0))
+        nbytes = len(ind.get("updu", b"") or b"")
+        self.live_messages.append({
+            "dir": "in", "from": f"NODE {src}", "addr": f"·{src:03d}",
+            "time": _now(), "text": text, "conf": "RECEIVED"})
+        self._add_prim("S_UNIDATA_INDICATION", f"from node {src} · {nbytes} oct")
+        self.changed.emit("chat")
+
+    def on_link_up(self, remote_addr: int, remote_sap: int) -> None:
+        self.chat_link_up = True
+        self._add_prim("S_HARD_LINK_ESTABLISH_CONFIRM", f"node {remote_addr} · SAP {remote_sap}")
+        self.changed.emit("chat")
+
+    def on_link_down(self, remote_addr: int, confirm: bool) -> None:
+        self.chat_link_up = False
+        name = "S_HARD_LINK_TERMINATE_CONFIRM" if confirm else "S_HARD_LINK_TERMINATED"
+        self._add_prim(name, f"node {remote_addr}")
+        self.changed.emit("chat")
+
+    def on_rejected(self, sap_id: int, reason: str) -> None:
+        self._add_prim("S_UNIDATA_REQUEST_REJECTED", f"SAP {sap_id} · {reason}")
+        self.changed.emit("chat")
+
+    def toggle_chat_link(self) -> None:
+        """Establish / terminate the SAP 5 hard link to the configured peer."""
+        if not (self.live and self.controller is not None):
+            self.chat_link_up = not self.chat_link_up   # demo: visual only
+            self.changed.emit("chat")
+            return
+        if self.chat_link_up:
+            self.controller.hard_link_terminate(CHAT_SAP)
+            self._add_prim("S_HARD_LINK_TERMINATE_REQUEST", f"SAP {CHAT_SAP}")
+        else:
+            self.controller.hard_link_establish(CHAT_SAP, CHAT_SAP)
+            self._add_prim("S_HARD_LINK_ESTABLISH_REQUEST",
+                           f"SAP {CHAT_SAP} → node {self.controller.remote_id}")
+        self.changed.emit("chat")
+
+    def _send_chat_live(self, text: str) -> None:
+        from src.stypes import DeliveryMode  # lazy: keeps demo mode backend-free
+        payload = text.encode("ascii", "replace") + b"\r\n"
+        try:
+            self.controller.send_unidata(CHAT_SAP, CHAT_SAP, payload,
+                                         priority=4, mode=DeliveryMode(arq_mode=True))
+        except Exception as exc:
+            self._add_prim("S_UNIDATA_REQUEST_REJECTED", f"send failed: {exc}")
+            return
+        self.live_messages.append({
+            "dir": "out", "from": self.node["callsign"],
+            "addr": "·" + self.node["address"].split(".")[-1],
+            "time": _now(), "text": text, "conf": "SENT · ARQ"})
+        self._add_prim("S_UNIDATA_REQUEST",
+                       f"SAP {CHAT_SAP} → node {self.controller.remote_id} · {len(payload)} oct")
 
     # ------------------------------------------------------------- modem cmd
     def set_modem_ip(self, v: str) -> None:
@@ -290,9 +374,12 @@ class ConsoleModel(QObject):
     def send_msg(self) -> None:
         text = self.draft.strip()
         if text:
-            self.messages.append({"dir": "out", "from": self.node["callsign"],
-                                  "addr": "·" + self.node["address"].split(".")[-1],
-                                  "time": "14:22", "text": text, "conf": "PENDING"})
+            if self.live and self.controller is not None:
+                self._send_chat_live(text)
+            else:
+                self.messages.append({"dir": "out", "from": self.node["callsign"],
+                                      "addr": "·" + self.node["address"].split(".")[-1],
+                                      "time": "14:22", "text": text, "conf": "PENDING"})
         self.draft = ""
         self.changed.emit("chat")
 
@@ -430,10 +517,34 @@ class ConsoleModel(QObject):
                         "av_fg": "#fff" if active else T.FG_MUTED})
         return out
 
+    def chat_header(self) -> dict:
+        """Peer identity + hard-link affordance for the thread column header."""
+        if self.live:
+            remote = self.controller.remote_id if self.controller is not None else 0
+            up = self.chat_link_up
+            return {
+                "live": True, "init": f"N{remote}", "name": f"NODE {remote}",
+                "sub": f"3.066.000.{remote:03d} · Point-to-point · SAP 5 · ARQ / NODE DELIVERY",
+                "link_up": up,
+                "status_label": "HARD LINK UP" if up else "NO HARD LINK",
+                "status_fg": T.GREEN_DARK if up else T.FG_GHOST2,
+                "status_bg": T.GREEN_BG if up else "#eceef1",
+                "btn_label": "Terminate Link" if up else "Establish Link",
+                "btn_kind": "danger" if up else "primary",
+            }
+        return {
+            "live": False, "init": "CR", "name": "CORVUS-06",
+            "sub": "3.066.000.006 · Point-to-point · ARQ / NODE DELIVERY",
+            "link_up": True, "status_label": "IN-ORDER",
+            "status_fg": T.GREEN_DARK, "status_bg": T.GREEN_BG,
+            "btn_label": "", "btn_kind": "",
+        }
+
     def chat_messages(self) -> list:
         a = self.theme.accent
+        src = self.live_messages if self.live else self.messages
         out = []
-        for m in self.messages:
+        for m in src:
             if m["dir"] == "in":
                 style = {"align": "l", "bubble_bg": "#ffffff", "bubble_border": "#dfe1e4",
                          "name_color": T.FG_MUTED, "conf_color": T.FG_GHOST2}
@@ -446,6 +557,9 @@ class ConsoleModel(QObject):
 
     def chat_prims(self) -> list:
         t = self.theme
+        if self.live:
+            return [{"time": tm, "name": nm, "detail": dt, "color": _prim_color(nm, t)}
+                    for tm, nm, dt in self.live_prims]
         raw = [
             ("14:22:02", "S_UNIDATA_REQUEST", "SAP 5 → 3.066.000.006 · 28 oct"),
             ("14:22:00", "S_UNIDATA_REQUEST_CONFIRM", "msg 0x4A2 · NODE DELIVERY"),

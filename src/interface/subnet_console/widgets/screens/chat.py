@@ -108,17 +108,22 @@ class ChatScreen(Screen):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
 
-        # thread header
+        # thread header — peer identity + (live) hard-link connect/disconnect
+        h = self.model.chat_header()
         hdr = C.scoped(QFrame(), "background:#ffffff;border:none;border-bottom:1px solid %s;" % T.SIDEBAR_DIV)
         hl = QHBoxLayout(hdr)
         hl.setContentsMargins(16, 9, 16, 9)
         hl.setSpacing(10)
-        hl.addWidget(_avatar("CR", a, "#fff", size=32, radius=7, fsize=12))
-        meta = C.col(C.lbl("CORVUS-06", size=13.5, weight=600, color="#25282c"),
-                     C.lbl("3.066.000.006 · Point-to-point · ARQ / NODE DELIVERY", size=10.5, mono=True, color=T.FG_FAINT),
+        hl.addWidget(_avatar(h["init"], a, "#fff", size=32, radius=7, fsize=12))
+        meta = C.col(C.lbl(h["name"], size=13.5, weight=600, color="#25282c"),
+                     C.lbl(h["sub"], size=10.5, mono=True, color=T.FG_FAINT),
                      spacing=0)
         hl.addWidget(meta, 1)
-        hl.addWidget(C.lbl("IN-ORDER", size=10, mono=True, color=T.GREEN_DARK, bg=T.GREEN_BG, radius=3, pad=(3, 8)))
+        hl.addWidget(C.lbl(h["status_label"], size=10, mono=True, color=h["status_fg"],
+                           bg=h["status_bg"], radius=3, pad=(3, 8)))
+        if h["live"]:
+            hl.addWidget(C.button(h["btn_label"], kind=h["btn_kind"], accent=a,
+                                  on_click=self.model.toggle_chat_link, size=11))
         v.addWidget(hdr)
 
         # messages

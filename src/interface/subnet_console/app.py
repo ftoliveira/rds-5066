@@ -44,6 +44,11 @@ def run(node: str = "A", accent: str = T.DEFAULT_ACCENT,
 
     if controller is not None:
         controller.status_changed.connect(model.apply_live_status)
+        # Fatia 2 — HFCHAT (SAP 5): RX, hard link e rejeições alimentam a thread/feed.
+        controller.unidata_received.connect(model.on_rx)
+        controller.link_established.connect(model.on_link_up)
+        controller.link_terminated.connect(model.on_link_down)
+        controller.request_rejected.connect(model.on_rejected)
         controller.node_error.connect(lambda s: print(f"[node] {s}", file=sys.stderr))
         # Reflete o alvo real do modem nos campos do painel Modem Link.
         model.modem.update(ip=controller.host, port=str(controller.port),

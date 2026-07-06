@@ -80,7 +80,7 @@ Opções de linha de comando:
 |--------|------|----------|:--------:|
 | SECTIONS | **Subnet Dashboard** | KPIs, ligações/peers, qualidade, SAPs, filas TX/RX, S-Primitives | demo |
 | SECTIONS | **Traffic Monitor** | contadores, alocação de SAP (Anexo F Tabela F-1), log de eventos | demo |
-| SIS CLIENTS | **HFCHAT Orderwire** (SAP 5) | operadores, *thread*, *feed* de primitivas | demo |
+| SIS CLIENTS | **HFCHAT Orderwire** (SAP 5) | operadores (demo), *thread* + *feed* ao vivo, hard link | **✅ live** |
 | SIS CLIENTS | **HF Mail** (HMTP 3 / HFPOP 4) | caixas, leitura/composição, *pipelining* HMTP | demo |
 | SIS CLIENTS | **IP Client** (SAP 9) | binding, QoS, rotas IP→STANAG, log de datagramas | demo |
 | SIS CLIENTS | **File Transfer** (RCOP 6 / UDOP 7) | compositor, fila, log de primitivas | demo |
@@ -149,12 +149,16 @@ Fatiar por ecrã, sempre verificando *headless* contra `tests/mock_110d_modem`
 - [x] **Fatia 1 — Modem Link ao vivo** *(feito, commit `fd668c0`)*
       NodeController + flag `--live`; painel Modem, pill do toolbar e dot da sidebar
       refletem `is_connected`/taxa reais; botão Connect/Disconnect arranca/desliga o nó.
-- [ ] **Fatia 2 — HFCHAT (SAP 5)** *(recomendada a seguir)*
-      Connect/Disconnect = `controller.hard_link_establish(5, 5)` / `hard_link_terminate(5)`;
-      enviar = `controller.send_unidata(5, 5, texto.encode('ascii')+b'\r\n', mode=DeliveryMode(arq_mode=True))`;
-      receber = ligar `unidata_received` (SAP 5, decodificar ASCII, tirar CRLF) → *append* à
-      thread; alimentar o *feed* de S-primitives a partir dos sinais. É o que torna o
-      `run_110d_real.sh` num teste de chat de ponta a ponta.
+- [x] **Fatia 2 — HFCHAT (SAP 5)** *(feito)*
+      `app.run()` liga `unidata_received`/`link_established`/`link_terminated`/`request_rejected`
+      aos slots `model.on_rx`/`on_link_up`/`on_link_down`/`on_rejected`. Botão **Establish/Terminate
+      Link** no cabeçalho da *thread* = `controller.hard_link_establish(5, 5)` /
+      `hard_link_terminate(5)`; enviar = `controller.send_unidata(5, 5, texto+CRLF,
+      mode=DeliveryMode(arq_mode=True))`; RX SAP 5 decodifica ASCII, tira CRLF e faz *append* à
+      *thread* ao vivo; o *feed* de S-primitives (`chat_prims()`) passa a ser real. Os accessors
+      `chat_messages()`/`chat_prims()`/`chat_header()` ramificam em `self.live`. Verificado ponta a
+      ponta em `tests/test_subnet_console_chat.py` (dois nós via `MockAir`, offscreen). É o que torna
+      o `run_110d_real.sh` num teste de chat de ponta a ponta.
 - [ ] **Fatia 3 — Dashboard + Traffic Monitor + status bar**
       Usar o snapshot de `status()` (CAS/SIS/DTS/ARQ, `tx_queue`); manter um log de
       eventos S-primitive em memória alimentado pelos sinais e mostrá-lo no monitor.
