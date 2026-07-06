@@ -15,11 +15,12 @@
 # servidor na porta 3000 do Appendix A). Um único encaminhamento SSH -L basta —
 # o modem nunca inicia conexão de volta.
 #
-# NOTA (Fase 1): o Subnet Console é, nesta fase, a casca de UI. O túnel e o
-# preflight abaixo continuam válidos (verificam a rota até o modem), e o console é
-# lançado com o painel "Modem Link" já pré-preenchido com host/porta do túnel —
-# mas a ligação TCP ao vivo ao modem (data path DTE↔DCE) é da Fase 2. Para um teste
-# de tráfego real contra o modem hoje, use src/interface/chat_app_110d.py.
+# NOTA (Fase 2, em progresso): o console é lançado em modo --live, arrancando um
+# StanagNode real e ABRINDO a ligação TCP ao modem (data path DTE↔DCE) via túnel —
+# o painel "Modem Link" mostra LINKED e a taxa reportada quando o handshake conclui.
+# Os clientes de tráfego (HFCHAT, Mail, ficheiros) estão a ser ligados ao backend
+# incrementalmente; enquanto isso, para um teste de tráfego de chat de ponta a ponta
+# use src/interface/chat_app_110d.py.
 #
 # Uso:
 #   scripts/run_110d_real.sh <serial_number> [opções]
@@ -158,7 +159,7 @@ cat <<EOF
  Modem (black): ${BLACK_IP}:${MODEM_PORT}   (via red)
  Túnel local:   127.0.0.1:${LOCAL_PORT}  ->  ${BLACK_IP}:${MODEM_PORT}
  Nó STANAG:     ${NODE}
- App:           Subnet Console (PyQt6) — Fase 1 (UI; painel Modem pré-preenchido)
+ App:           Subnet Console (PyQt6) — modo --live (liga ao modem real)
 ────────────────────────────────────────────────────────────
 EOF
 
@@ -199,8 +200,8 @@ fi
 # ---------------------------------------------------------------------------
 # Lança a app (ou mantém só o túnel)
 # ---------------------------------------------------------------------------
-# Argumentos da app (--accent só é passado se fornecido).
-APP_ARGS=(--node "$NODE" --modem-host 127.0.0.1 --modem-port "$LOCAL_PORT")
+# Argumentos da app. --live arranca um StanagNode real ligado ao modem via túnel.
+APP_ARGS=(--live --node "$NODE" --modem-host 127.0.0.1 --modem-port "$LOCAL_PORT")
 [[ -n "$ACCENT" ]] && APP_ARGS+=(--accent "$ACCENT")
 
 if [[ "$NO_APP" -eq 1 ]]; then
