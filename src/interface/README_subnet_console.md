@@ -86,6 +86,7 @@ Opções de linha de comando:
 | SIS CLIENTS | **IP Client** (SAP 9) | binding, QoS, rotas IP→STANAG, envio+RX de datagramas | **✅ live** |
 | SIS CLIENTS | **File Transfer** (RCOP 6 / UDOP 7) | chunking FILE/FCON/FEND/FALL, envio, RX+reassembly, progresso | **✅ live** |
 | SIS CLIENTS | **Raw SIS Socket** (F.16) | parâmetros, clientes ligados, *wire log* | **✅ live** |
+| RADIO | **Radio Control** (ALE 2G · UDP 54001) | freq/potência/VSWR/SINAD/BER/RSSI, canais, scan, LQA, sounding, AMD, chamadas/links | **✅ live** |
 | SETUP | **Modem Link** (110C no design / 110D real) | ligação, taxa, interleaver | **✅ live** |
 | SETUP | **Configuration** | servidor SIS; requisitos HFCHAT (ARQ/prio/in-order/confirm) ligados ao envio | **✅ HFCHAT live** |
 
@@ -105,6 +106,16 @@ Opções de linha de comando:
 > HFCHAT). No ecrã **IP Client**, **Send Test Datagram** injeta um datagrama IPv4 no par; no
 > **HF Mail**, **Submit to HF** envia o mail-object por HMTP e **Poll HFPOP** faz RETR. O nó
 > recetor mostra o datagrama no *log* e o mail-object na *inbox*.
+>
+> **Radio Control (ALE 2G):** subsistema separado do STANAG 5066 — controla o **rádio HF**
+> (não o modem de dados) via o protocolo `docs/PROTOCOLO-CONTROLE-REMOTO.md` em **UDP :54001**.
+> Em `--live` liga-se automaticamente ao **mesmo host do modem** (override: `--ale-host` /
+> `--ale-port`), envia `HELLO` a 1 s e descodifica a telemetria (STATE ~5 Hz + CHANNELS/SCAN/
+> LQA/SOUND_HIST/LOG/AMD). O ecrã exibe frequência/potência/VSWR/SINAD/BER/RSSI, a tabela de
+> canais, matriz LQA, sounding e AMD, e envia o conjunto completo de comandos (CALL/GROUP/NET/
+> TERM/SOUND/CONFIG/FORCE_LINK/CHEDIT/AMD). Em modo demo mostra uma cena estática. A telemetria
+> ao vivo repinta por dois tópicos: `radio` (estrutural — controlos/modo/link/canais) e
+> `radio_tele` (telemetria rápida, tabelas), para não roubar o foco dos campos de texto.
 
 ## 4. Arquitetura
 
@@ -117,11 +128,12 @@ subnet_console/
 ├── window.py          # SubnetConsoleWindow (frameless): chrome + QStackedWidget
 ├── backend/
 │   ├── node_controller.py  # NodeController — nó STANAG 5066 real atrás de sinais Qt
+│   ├── ale_controller.py   # AleController — cliente UDP do rádio ALE 2G (54001) atrás de sinais Qt
 │   └── sis_server.py       # InstrumentedSisServer — RawSisSocketServer + wire log/roster
 └── widgets/
     ├── common.py      # primitivas reutilizáveis (Card, KpiTile, Table, pill, …)
     ├── titlebar/menubar/toolbar/sidebar/statusbar.py   # chrome
-    └── screens/       # base.py + os 9 ecrãs
+    └── screens/       # base.py + os 10 ecrãs (inclui radio.py)
 ```
 
 O ponto central é o **`ConsoleModel`**: expõe *view accessors* (`links()`,
@@ -164,6 +176,25 @@ sis_max_clients, sis_clients, sis_wire, sis_prim_count`. (`arq_unacked` = frames
 ainda não confirmados — o progresso de ficheiros usa-o para a fila drenar a zero. SAPs
 ligados por omissão: `(3, 4, 5, 6, 7, 9)` — HMTP, HFPOP, HFCHAT, RCOP, UDOP e IP Client.
 O Raw SIS Socket Server arranca junto do nó em `start()` e fecha em `stop()`.)
+
+### AleController — API (Radio Control, ALE 2G)
+
+`backend/ale_controller.py` é o cliente UDP do protocolo de controlo remoto do rádio
+(`docs/PROTOCOLO-CONTROLE-REMOTO.md`, porta 54001), independente do `NodeController`.
+Espelha o modelo de *threading*: uma thread daemon de RX (`recv` bloqueante) só emite
+sinais Qt; o `HELLO` (a 1 s, via `QTimer`) e todos os comandos correm na thread da GUI.
+
+**Sinais:** `state_changed(dict)` (STATE ~5 Hz), `channels_changed(list)`, `scan_changed(list)`,
+`lqa_changed(dict)`, `sound_hist_changed(list)`, `log_received(dict)`, `amd_received(dict)`,
+`connection_changed(bool)` (backend passou a responder / ficou silencioso >3 s), `error(str)`.
+
+**Comandos:** `send_call(addr, channel=-1)`, `send_group(members)`, `send_net(netid)`,
+`send_amd(dest, text)`, `send_term(addr="")`, `send_sound(mode=1)`,
+`send_config(*, scan_rate, sideband, sounding_enabled, occupancy_detect, twa_s, tx_power_dbm,
+tcc_max_s, tm_max_s)` (cada campo tem sentinela "inalterado"), `send_force_link(channel, forced,
+service)`, `send_chedit(idx, freq, name)`. O `ConsoleModel` liga estes sinais a `on_ale_*` e
+expõe o accessor `radio_view()` + comandos `ale_*`; ver `tests/mock_ale_backend.py` para um
+backend de referência e `tests/test_subnet_console_radio.py` para o round-trip.)
 
 ## 6. Estado e roteiro da Fase 2 (atividades)
 

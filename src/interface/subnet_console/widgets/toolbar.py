@@ -37,7 +37,7 @@ class Toolbar(QFrame):
         self._rebuild()
 
     def _on_changed(self, topic: str):
-        if topic == "modem":
+        if topic in ("modem", "radio", "radio_tele", "toolbar"):
             self._rebuild()
 
     def _rebuild(self):
@@ -68,13 +68,13 @@ class Toolbar(QFrame):
 
         self._lay.addStretch(1)
 
-        n = self.model.node
+        rf = self.model.rf_readouts()
         readouts = QHBoxLayout()
         readouts.setSpacing(16)
-        readouts.addWidget(_readout("FREQ", n["freq"]))
-        readouts.addWidget(_readout("MODE", n["waveform"]))
-        readouts.addWidget(_readout("RATE", n["dataRate"]))
-        readouts.addWidget(_readout("SNR", n["snr"], value_color=T.GREEN_DARK))
+        readouts.addWidget(_readout("FREQ", rf["freq"]))
+        readouts.addWidget(_readout("MODE", rf["mode"]))
+        readouts.addWidget(_readout("RATE", rf["rate"]))
+        readouts.addWidget(_readout("SNR", rf["snr"], value_color=rf["snr_color"]))
         holder = QWidget()
         holder.setLayout(readouts)
         self._lay.addWidget(holder)

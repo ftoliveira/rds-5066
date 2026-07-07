@@ -28,6 +28,7 @@ def _build_screens(model: ConsoleModel) -> dict:
     from .widgets.screens.mail import MailScreen
     from .widgets.screens.ipclient import IpClientScreen
     from .widgets.screens.filexfer import FileTransferScreen
+    from .widgets.screens.radio import RadioScreen
     from .widgets.screens.sissocket import SisSocketScreen
     from .widgets.screens.modem import ModemScreen
     from .widgets.screens.config import ConfigScreen
@@ -39,6 +40,7 @@ def _build_screens(model: ConsoleModel) -> dict:
         "mail": MailScreen(model),
         "ipclient": IpClientScreen(model),
         "filexfer": FileTransferScreen(model),
+        "radio": RadioScreen(model),
         "sissocket": SisSocketScreen(model),
         "modem": ModemScreen(model),
         "config": ConfigScreen(model),

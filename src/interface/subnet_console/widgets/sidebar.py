@@ -41,7 +41,7 @@ class Sidebar(QFrame):
         self._rebuild()
 
     def _on_changed(self, topic: str):
-        if topic in ("mail", "filexfer", "modem"):
+        if topic in ("mail", "filexfer", "modem", "radio"):
             self._rebuild()
 
     def _rebuild(self):
@@ -74,6 +74,7 @@ class Sidebar(QFrame):
         ft_active = str(m._ft_active_count())
         ft_badge_bg = "#a0a4aa" if ft_active == "0" else T.GREEN
         mv = m.modem_view()
+        rs = m.radio_status()
 
         # ---- sections ----
         self._section("SECTIONS", [
@@ -86,6 +87,9 @@ class Sidebar(QFrame):
             self._nav("IP", 9, "IP Client", "ipclient", trailing="9"),
             self._nav("FX", 9, "File Transfer", "filexfer", badge=(ft_active, ft_badge_bg), trailing="6·7"),
             self._nav("SK", 9, "Raw SIS Socket", "sissocket", trailing="all", trailing_size=9),
+        ])
+        self._section("RADIO", [
+            self._nav("RF", 9, "Radio Control", "radio", status_dot=rs["dot"]),
         ])
         self._section("SETUP", [
             self._nav("ML", 9, "Modem Link", "modem", status_dot=mv["stat"]["dot"]),
