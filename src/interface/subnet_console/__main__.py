@@ -31,10 +31,16 @@ def main() -> int:
     p.add_argument("--bitrate", type=int, default=2400, help="initial data rate (bps) in --live mode")
     p.add_argument("--interleaver", default="long", choices=["short", "long"],
                    help="initial interleaver in --live mode")
+    p.add_argument("--ale-host", default=None,
+                   help="ALE radio-control backend host in --live mode (default: --modem-host)")
+    p.add_argument("--ale-port", default=None, help="ALE control UDP port (default 54001)")
+    p.add_argument("--no-ale", action="store_true",
+                   help="do not open the ALE radio-control (UDP 54001) client in --live mode")
     args = p.parse_args()
     return run(node=args.node, accent=T.ACCENT_OPTIONS[args.accent],
                modem_host=args.modem_host, modem_port=args.modem_port,
-               live=args.live, bitrate=args.bitrate, interleaver=args.interleaver)
+               live=args.live, bitrate=args.bitrate, interleaver=args.interleaver,
+               ale_host=args.ale_host, ale_port=args.ale_port, no_ale=args.no_ale)
 
 
 if __name__ == "__main__":

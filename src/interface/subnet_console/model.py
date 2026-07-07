@@ -20,10 +20,13 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from .theme import DEFAULT_ACCENT, Theme
 from . import theme as T
+from .backend.ale_controller import (
+    OCC_NAMES, RF_POWER_STEPS, SIDEBAND_NAMES, SOUND_MODE_NAMES,
+)
 
 SCREENS = [
     "dashboard", "monitor", "chat", "mail",
-    "ipclient", "filexfer", "sissocket", "modem", "config",
+    "ipclient", "filexfer", "radio", "sissocket", "modem", "config",
 ]
 
 CHAT_SAP = 5   # HFCHAT Orderwire (Annex F.7)
@@ -99,6 +102,68 @@ class _ClientNode:
         pass
 
 
+# ---- ALE radio (remote-control protocol) demo + defaults -------------------
+# Offline snapshot of an ``alel_state_t`` (same keys AleController decodes).
+ALE_STATE_DEFAULT = {
+    "fsm": 0, "fsm_name": "AVAILABLE", "linked": False,
+    "scanning": False, "scan_rate": 5, "cur_channel": -1,
+    "sinad": -1, "ber": -1, "rssi": -1, "noise": -1,
+    "twa_remain": 0, "twa_max": 0, "self_addr": "", "link_peer": "",
+    "voice_open": False, "ptt": False, "rx_voice": False,
+    "sideband": 0, "sideband_name": "USB",
+    "frames_rx": 0, "sounds_rx": 0, "words_valid": 0,
+    "tx_active": False, "tx_power": 0.0, "tx_refl": 0.0, "tx_vswr": 0.0,
+    "tx_power_unit": "W", "tx_refl_unit": "W",
+    "sounding": False, "sounding_channel": -1,
+    "forced": False, "active_service": "",
+    "tcc_max": 0, "tm_max": 0, "occupancy_detect": False, "tx_power_dbm": 0,
+}
+
+_ALE_DEMO_CHANNELS = [
+    ("3.596", "NVIS-A", "HF"), ("5.357", "REGION-1", "HF"), ("7.102", "LONG-A", "HF"),
+    ("10.145", "LONG-B", "HF"), ("14.109", "DX-1", "HF"), ("18.106", "DX-2", "HF"),
+    ("21.096", "DX-3", "HF"), ("24.928", "LONG-C", "HF"),
+]
+_ALE_DEMO_OCC = [1, 0, 2, 1, 1, 0, 1, 0]     # per-channel occupancy enum
+_ALE_DEMO_LQA = [24, 12, 27, 21, 29, 9, 18, 6]
+
+
+def _ale_demo_scene(prof: dict) -> dict:
+    """A full, self-consistent Radio Control demo scene (no backend)."""
+    channels = [{"idx": i, "freq": f, "name": nm, "band": b, "enabled": True}
+                for i, (f, nm, b) in enumerate(_ALE_DEMO_CHANNELS)]
+    scan = [{"label": f, "lqa": _ALE_DEMO_LQA[i], "occ": _ALE_DEMO_OCC[i],
+             "occ_name": OCC_NAMES[_ALE_DEMO_OCC[i]]}
+            for i, (f, nm, b) in enumerate(_ALE_DEMO_CHANNELS)]
+    state = dict(ALE_STATE_DEFAULT)
+    state.update(fsm=2, fsm_name="LINKED", linked=True, scanning=False, scan_rate=5,
+                 cur_channel=4, sinad=22, ber=3, rssi=-71, noise=-103,
+                 twa_remain=118, twa_max=300, self_addr="BR1", link_peer="BR2",
+                 sideband=0, sideband_name="USB", frames_rx=184213, sounds_rx=42,
+                 words_valid=9317, tx_power=44.2, tx_refl=1.1, tx_vswr=1.4,
+                 tx_power_unit="W", tx_refl_unit="W", tcc_max=127, tm_max=30,
+                 occupancy_detect=True, tx_power_dbm=47)
+    lqa = {"n_channels": len(channels), "peers": [
+        {"addr": "BR2", "online": True, "lqa": _ALE_DEMO_LQA},
+        {"addr": "BR3", "online": True, "lqa": [17, 8, 22, 19, 25, 5, 14, 31]},
+    ]}
+    sound_hist = [
+        {"t": "14:19:02", "ch": 4, "q": 29, "ack": "BR2"},
+        {"t": "14:16:41", "ch": 3, "q": 21, "ack": "BR2"},
+        {"t": "14:12:10", "ch": 6, "q": 18, "ack": "—"},
+    ]
+    log = [
+        {"kind": 4, "kind_name": "LQA", "t": "14:19:02", "text": "LQA BR2 ch4 SINAD 29"},
+        {"kind": 0, "kind_name": "RX", "t": "14:18:50", "text": "LINKED with BR2 on ch4"},
+        {"kind": 3, "kind_name": "SND", "t": "14:16:41", "text": "Sounding ch3 acked by BR2"},
+        {"kind": 2, "kind_name": "SYS", "t": "14:10:00", "text": "Scan resumed (5 ch/s)"},
+    ]
+    amd = [{"from": "BR2", "t": "14:18:33", "read": False,
+            "text": "QSL, holding 14109. Send traffic when ready."}]
+    return {"state": state, "channels": channels, "scan": scan, "lqa": lqa,
+            "sound_hist": sound_hist, "log": log, "amd": amd}
+
+
 class ConsoleModel(QObject):
     screen_changed = pyqtSignal(str)   # navigation → window switches the stack
     changed = pyqtSignal(str)          # a data topic changed → screen rebuilds
@@ -106,7 +171,7 @@ class ConsoleModel(QObject):
 
     def __init__(self, node: str = "A", accent: str = DEFAULT_ACCENT,
                  modem_host: Optional[str] = None, modem_port: Optional[str] = None,
-                 controller=None):
+                 controller=None, ale_controller=None):
         super().__init__()
         self.theme = Theme(accent)
         prof = NODE_PROFILES.get(node.upper(), NODE_PROFILES["A"])
@@ -117,6 +182,37 @@ class ConsoleModel(QObject):
         self.controller = controller
         self.live = controller is not None
         self._live_status: dict = {"running": False, "connected": False}
+
+        # Radio Control (protocolo ALE 2G, UDP 54001). Independente do STANAG:
+        # quando um AleController está ligado, o ecrã Radio Control mostra
+        # telemetria real; sem ele, mostra o snapshot de demonstração.
+        self.ale = ale_controller
+        self.ale_live = ale_controller is not None
+        self._ale_reachable = False
+        self._ale_state: dict = dict(ALE_STATE_DEFAULT)
+        self._ale_channels: List[dict] = []
+        self._ale_scan: List[dict] = []
+        self._ale_lqa: dict = {"n_channels": 0, "peers": []}
+        self._ale_sound_hist: List[dict] = []
+        self._ale_log: List[dict] = []      # newest first (cap 200)
+        self._ale_amd: List[dict] = []      # received AMD, newest first (cap 50)
+        self._ale_struct_key: tuple = ()    # last structural STATE fingerprint
+        self._ale_tele_paint = 0.0          # throttle stamp for radio_tele repaints
+        # Demo snapshot (used unless ale_live); a full, self-consistent scene.
+        self._ale_demo = _ale_demo_scene(prof)
+        # Editable drafts for the control forms (silent setters — no rebuild).
+        self.ale_call_addr = ""
+        self.ale_call_channel = ""          # "" = auto (-1)
+        self.ale_group_members = ""         # comma/space separated
+        self.ale_net_id = ""
+        self.ale_amd_dest = ""
+        self.ale_amd_text = ""
+        self.ale_chedit_idx = ""
+        self.ale_chedit_freq = ""
+        self.ale_chedit_name = ""
+        self.ale_twa_draft = ""             # Twa (s) pending Apply
+        self.ale_sound_mode = 1             # 0=SINGLE 1=SCANNING 2=HANDSHAKE
+        self.ale_force_service = "am"       # tenant for FORCE_LINK/NORMAL
 
         # Fatia 2/3 — estado ao vivo. A thread do HFCHAT (`live_messages`) e o
         # log de eventos S-primitive (`live_events`, fonte única do feed do chat,
@@ -650,6 +746,512 @@ class ConsoleModel(QObject):
     def reset_modem(self) -> None:
         self.modem.update(ip="192.168.10.20", port="4532", rate=2400, interleaver="LONG")
         self.changed.emit("modem")
+
+    # ============================================================= ALE radio
+    # Remote-control protocol (docs/PROTOCOLO-CONTROLE-REMOTO.md). Two repaint
+    # topics keep the screen usable while STATE streams at ~5 Hz:
+    #   "radio"      — structural rebuild (controls, mode, channel table, status);
+    #                  fired only when a config/mode/link field changes.
+    #   "radio_tele" — live-display refresh (telemetry readouts, scan, LQA, log,
+    #                  AMD); fired on every STATE (throttled) and table update, so
+    #                  the fast analog numbers refresh without touching the inputs.
+    def _ale_structural_key(self, st: dict) -> tuple:
+        return (st.get("fsm"), st.get("link_peer"), st.get("self_addr"),
+                st.get("sideband"), st.get("scan_rate"), st.get("tx_power_dbm"),
+                st.get("occupancy_detect"), st.get("twa_max"), st.get("tcc_max"),
+                st.get("tm_max"), st.get("forced"), st.get("active_service"),
+                st.get("scanning"))
+
+    def _paint_tele(self) -> None:
+        now = time.monotonic()
+        if now - self._ale_tele_paint < 0.25:
+            return
+        self._ale_tele_paint = now
+        self.changed.emit("radio_tele")
+        self.changed.emit("toolbar")
+
+    def on_ale_state(self, st: dict) -> None:
+        self._ale_state = st
+        key = self._ale_structural_key(st)
+        if key != self._ale_struct_key:
+            self._ale_struct_key = key
+            self.changed.emit("radio")
+            self.changed.emit("toolbar")
+        self._paint_tele()
+
+    def on_ale_channels(self, ch: list) -> None:
+        self._ale_channels = ch
+        self.changed.emit("radio")      # channel table is structural
+        self.changed.emit("toolbar")    # current-frequency label reads the table
+
+    def on_ale_scan(self, rows: list) -> None:
+        self._ale_scan = rows
+        self.changed.emit("radio_tele")
+
+    def on_ale_lqa(self, lqa: dict) -> None:
+        self._ale_lqa = lqa
+        self.changed.emit("radio_tele")
+
+    def on_ale_sound_hist(self, rows: list) -> None:
+        self._ale_sound_hist = rows
+        self.changed.emit("radio_tele")
+
+    def on_ale_log(self, entry: dict) -> None:
+        self._ale_log.insert(0, dict(entry))
+        del self._ale_log[200:]
+        self.changed.emit("radio_tele")
+
+    def on_ale_amd(self, msg: dict) -> None:
+        self._ale_amd.insert(0, dict(msg))
+        del self._ale_amd[50:]
+        self.changed.emit("radio_tele")
+
+    def on_ale_conn(self, up: bool) -> None:
+        self._ale_reachable = bool(up)
+        if not up:   # backend went silent → fall back to an offline snapshot
+            self._ale_state = dict(ALE_STATE_DEFAULT)
+            self._ale_struct_key = ()
+        self.changed.emit("radio")
+        self.changed.emit("toolbar")
+        self.changed.emit("statusbar")
+
+    # ---- data sources (live vs demo) ----
+    def _radio_state(self) -> dict:
+        return self._ale_state if self.ale_live else self._ale_demo["state"]
+
+    def _radio_channels(self) -> list:
+        return self._ale_channels if self.ale_live else self._ale_demo["channels"]
+
+    def _radio_scan(self) -> list:
+        return self._ale_scan if self.ale_live else self._ale_demo["scan"]
+
+    def _radio_lqa(self) -> dict:
+        return self._ale_lqa if self.ale_live else self._ale_demo["lqa"]
+
+    def _radio_sound_hist(self) -> list:
+        return self._ale_sound_hist if self.ale_live else self._ale_demo["sound_hist"]
+
+    def _radio_log(self) -> list:
+        return self._ale_log if self.ale_live else self._ale_demo["log"]
+
+    def _radio_amd(self) -> list:
+        return self._ale_amd if self.ale_live else self._ale_demo["amd"]
+
+    def _radio_online(self) -> bool:
+        return (not self.ale_live) or self._ale_reachable
+
+    # ---- colours ----
+    def _lqa_color(self, v) -> str:
+        if v is None or v < 0 or v >= 31:
+            return T.FG_GHOST
+        if v >= 22:
+            return T.GREEN_DARK
+        if v >= 12:
+            return T.AMBER
+        return T.RED
+
+    def _occ_color(self, occ) -> str:
+        return {0: T.FG_GHOST, 1: T.GREEN_DARK, 2: T.AMBER, 3: T.RED}.get(occ, T.FG_GHOST)
+
+    # ---- accessors ----
+    def radio_status(self) -> dict:
+        t = self.theme
+        st = self._radio_state()
+        if not self._radio_online():
+            return {"label": "RADIO OFFLINE", "fg": T.RED_DARK, "bg": T.RED_BG,
+                    "border": T.RED_BORDER, "dot": T.RED, "halo": "#f0cfc9"}
+        if st.get("linked"):
+            return {"label": f"LINKED · {st.get('link_peer') or '—'}", "fg": T.GREEN_DARK,
+                    "bg": T.GREEN_BG, "border": T.GREEN_BORDER, "dot": T.GREEN, "halo": T.GREEN_HALO}
+        if st.get("fsm") == 1:
+            return {"label": "LINKING", "fg": T.AMBER, "bg": T.AMBER_BG, "border": "#e3cfa0",
+                    "dot": T.AMBER, "halo": "#f0e2c0"}
+        if st.get("forced"):
+            return {"label": "FORCED", "fg": T.AMBER, "bg": T.AMBER_BG, "border": "#e3cfa0",
+                    "dot": T.AMBER, "halo": "#f0e2c0"}
+        if st.get("scanning"):
+            return {"label": "SCANNING", "fg": t.accent, "bg": t.accent_note_bg,
+                    "border": t.accent_note_border, "dot": t.accent, "halo": t.accent_note_bg}
+        return {"label": "AVAILABLE", "fg": T.FG_MUTED, "bg": "#eef1f4",
+                "border": T.INPUT_BORDER, "dot": "#9aa0a6", "halo": "#e3e6ea"}
+
+    def rf_readouts(self) -> dict:
+        """Toolbar FREQ/MODE/RATE/SNR — overridden by live ALE telemetry."""
+        n = self.node
+        out = {"freq": n["freq"], "mode": n["waveform"], "rate": n["dataRate"],
+               "snr": n["snr"], "snr_color": T.GREEN_DARK}
+        if not self.ale_live:
+            return out
+        st = self._ale_state
+        chans = self._ale_channels
+        cur = st.get("cur_channel", -1)
+        if isinstance(cur, int) and 0 <= cur < len(chans) and chans[cur].get("freq"):
+            out["freq"] = f"{chans[cur]['freq']} MHz"
+        elif not self._ale_reachable:
+            out["freq"] = "— MHz"
+        sb = st.get("sideband_name")
+        if sb:
+            out["mode"] = f"ALE {sb}"
+        sinad = st.get("sinad")
+        if isinstance(sinad, int) and sinad >= 0:
+            out["snr"] = f"{sinad} dB"
+        elif self.ale_live:
+            out["snr"] = "—"
+            out["snr_color"] = T.FG_GHOST
+        return out
+
+    def radio_view(self) -> dict:
+        t = self.theme
+        a = t.accent
+        st = self._radio_state()
+        chans = self._radio_channels()
+        scan = self._radio_scan()
+        online = self._radio_online()
+        cur = st.get("cur_channel", -1)
+        cur_ch = chans[cur] if isinstance(cur, int) and 0 <= cur < len(chans) else None
+
+        def sig(v):     # SINAD/BER: doc §5 "<0 = sem medida"
+            return "—" if (v is None or (isinstance(v, int) and v < 0)) else str(v)
+
+        def lvl(v):     # RSSI/NOISE dBm — negative is normal; blank when offline
+            return str(v) if (online and v is not None) else "—"
+
+        vswr = st.get("tx_vswr") or 0.0
+        vswr_color = (T.RED if vswr >= 2.0 else T.AMBER if vswr > 1.5 else T.GREEN_DARK) if vswr else T.FG_GHOST
+        kpis = [
+            {"label": "FREQUENCY", "value": cur_ch["freq"] if cur_ch else "—", "unit": "MHz"},
+            {"label": "TX POWER", "value": str(st.get("tx_power_dbm")) if st.get("tx_power_dbm") else "—",
+             "unit": "dBm"},
+            {"label": "VSWR", "value": f"{vswr:.2f}" if vswr else "—",
+             "delta": "match ok" if vswr and vswr <= 1.5 else ("high" if vswr else ""),
+             "delta_color": vswr_color},
+            {"label": "SINAD", "value": sig(st.get("sinad")), "unit": "dB"},
+            {"label": "BER", "value": sig(st.get("ber"))},
+            {"label": "RSSI", "value": lvl(st.get("rssi")), "unit": "dBm"},
+        ]
+        readouts = [
+            ("NOISE", f"{lvl(st.get('noise'))}" + (" dBm" if online and st.get("noise") is not None else "")),
+            ("FWD PWR", f"{st.get('tx_power', 0):.1f} {st.get('tx_power_unit') or ''}".strip()
+             if st.get("tx_active") or st.get("tx_power") else "—"),
+            ("REFL PWR", f"{st.get('tx_refl', 0):.1f} {st.get('tx_refl_unit') or ''}".strip()
+             if st.get("tx_active") or st.get("tx_refl") else "—"),
+            ("Twa", f"{st.get('twa_remain', 0)} / {st.get('twa_max', 0)} s"),
+            ("Tcc / Tm", f"{st.get('tcc_max', 0)} / {st.get('tm_max', 0)} s"),
+            ("FRAMES RX", str(st.get("frames_rx", 0))),
+            ("WORDS OK", str(st.get("words_valid", 0))),
+            ("SOUNDS RX", str(st.get("sounds_rx", 0))),
+        ]
+
+        # channel table merged with per-channel scan occupancy/quality
+        channels_view = []
+        for c in chans:
+            i = c.get("idx")
+            sc = scan[i] if isinstance(i, int) and i < len(scan) else None
+            lqa_v = sc["lqa"] if sc else 31
+            occ = sc["occ"] if sc else 0
+            channels_view.append({
+                "idx": i, "freq": c.get("freq", ""), "name": c.get("name", ""),
+                "band": c.get("band", ""), "current": (i == cur),
+                "lqa": lqa_v, "lqa_txt": str(lqa_v) if 0 <= lqa_v < 31 else "—",
+                "lqa_color": self._lqa_color(lqa_v),
+                "occ_name": OCC_NAMES.get(occ, "?"), "occ_color": self._occ_color(occ),
+            })
+
+        # LQA matrix (peers × channels)
+        lqa = self._radio_lqa()
+        ncol = min(int(lqa.get("n_channels", 0) or len(chans)), len(chans), 16)
+        lqa_labels = [chans[i]["freq"] for i in range(ncol)] if chans else []
+        lqa_peers = []
+        for p in lqa.get("peers", []):
+            cells = []
+            for j in range(ncol):
+                v = p["lqa"][j] if j < len(p["lqa"]) else 31
+                cells.append({"txt": str(v) if 0 <= v < 31 else "·", "color": self._lqa_color(v)})
+            lqa_peers.append({"addr": p.get("addr", "?"), "online": p.get("online", True), "cells": cells})
+
+        sound_hist = [{"t": r.get("t", ""), "ch": r.get("ch", -1), "q": r.get("q", 0),
+                       "q_color": self._lqa_color(r.get("q", 0)), "ack": r.get("ack", "—")}
+                      for r in self._radio_sound_hist()]
+
+        LOGCOL = {"RX": T.GREEN_DARK, "TX": a, "SYS": T.FG_MUTED, "SND": T.PURPLE,
+                  "LQA": T.AMBER, "ERR": T.RED}
+        log = [{"t": e.get("t", ""), "kind": e.get("kind_name", ""),
+                "color": LOGCOL.get(e.get("kind_name", ""), T.FG_MUTED), "text": e.get("text", "")}
+               for e in self._radio_log()]
+        amd = [{"from": m.get("from", "?"), "t": m.get("t", ""), "read": m.get("read", False),
+                "text": m.get("text", "")} for m in self._radio_amd()]
+
+        return {
+            "accent": a, "online": online, "live": self.ale_live,
+            "status": self.radio_status(),
+            "self_addr": st.get("self_addr") or "—", "link_peer": st.get("link_peer") or "",
+            "linked": bool(st.get("linked")), "fsm_name": st.get("fsm_name", ""),
+            "forced": bool(st.get("forced")), "scanning": bool(st.get("scanning")),
+            "active_service": st.get("active_service") or "",
+            "kpis": kpis, "readouts": readouts,
+            # control states
+            "tx_power_dbm": st.get("tx_power_dbm", 0),
+            "power_steps": [{"n": n, "active": n == st.get("tx_power_dbm")} for n in RF_POWER_STEPS],
+            "sideband": st.get("sideband", 0),
+            "sidebands": [{"v": v, "name": nm, "active": v == st.get("sideband")}
+                          for v, nm in SIDEBAND_NAMES.items()],
+            "scan_rate": st.get("scan_rate", 0),
+            "scan_rates": [{"n": n, "active": n == st.get("scan_rate")} for n in (2, 5, 10)],
+            "occupancy": bool(st.get("occupancy_detect")),
+            "twa_max": st.get("twa_max", 0), "twa_remain": st.get("twa_remain", 0),
+            "sound_mode": self.ale_sound_mode,
+            "sound_modes": [{"v": v, "name": nm, "active": v == self.ale_sound_mode}
+                            for v, nm in SOUND_MODE_NAMES.items()],
+            "force_service": self.ale_force_service,
+            "force_services": [{"v": s, "active": s == self.ale_force_service}
+                               for s in ("am", "fm", "110")],
+            # drafts
+            "call_addr": self.ale_call_addr, "call_channel": self.ale_call_channel,
+            "group_members": self.ale_group_members, "net_id": self.ale_net_id,
+            "amd_dest": self.ale_amd_dest, "amd_text": self.ale_amd_text,
+            "chedit_idx": self.ale_chedit_idx, "chedit_freq": self.ale_chedit_freq,
+            "chedit_name": self.ale_chedit_name, "twa_draft": self.ale_twa_draft,
+            # tables
+            "channels": channels_view, "lqa_labels": lqa_labels, "lqa_peers": lqa_peers,
+            "sound_hist": sound_hist, "log": log, "amd": amd,
+        }
+
+    # ---- silent draft setters (no rebuild — keep focus while typing) ----
+    def set_ale_call_addr(self, v: str) -> None:
+        self.ale_call_addr = v[:15]
+
+    def set_ale_call_channel(self, v: str) -> None:
+        self.ale_call_channel = "".join(c for c in v if c.isdigit() or c == "-")[:4]
+
+    def set_ale_group(self, v: str) -> None:
+        self.ale_group_members = v
+
+    def set_ale_net(self, v: str) -> None:
+        self.ale_net_id = v[:15]
+
+    def set_ale_amd_dest(self, v: str) -> None:
+        self.ale_amd_dest = v[:15]
+
+    def set_ale_amd_text(self, v: str) -> None:
+        self.ale_amd_text = v[:91]
+
+    def set_ale_chedit_idx(self, v: str) -> None:
+        self.ale_chedit_idx = "".join(c for c in v if c.isdigit())[:2]
+
+    def set_ale_chedit_freq(self, v: str) -> None:
+        self.ale_chedit_freq = v[:7]
+
+    def set_ale_chedit_name(self, v: str) -> None:
+        self.ale_chedit_name = v[:11]
+
+    def set_ale_twa(self, v: str) -> None:
+        self.ale_twa_draft = "".join(c for c in v if c.isdigit())[:5]
+
+    # ---- demo helpers ----
+    def _ale_demo_log(self, kind: int, name: str, text: str) -> None:
+        self._ale_demo["log"].insert(0, {"kind": kind, "kind_name": name, "t": _now(), "text": text})
+        del self._ale_demo["log"][200:]
+
+    def _parse_call_channel(self) -> int:
+        s = (self.ale_call_channel or "").strip()
+        try:
+            return int(s)
+        except ValueError:
+            return -1
+
+    # ---- commands ----
+    def ale_call(self) -> None:
+        addr = (self.ale_call_addr or "").strip()
+        if not addr:
+            return
+        ch = self._parse_call_channel()
+        if self.ale_live and self.ale is not None:
+            self.ale.send_call(addr, ch)
+        else:
+            d = self._ale_demo["state"]
+            d.update(fsm=2, fsm_name="LINKED", linked=True, link_peer=addr, scanning=False)
+            if 0 <= ch < len(self._ale_demo["channels"]):
+                d["cur_channel"] = ch
+            self._ale_demo_log(1, "TX", f"CALL {addr}" + (f" ch{ch}" if ch >= 0 else " (auto)"))
+            self.changed.emit("radio")
+            self.changed.emit("toolbar")
+
+    def ale_group_call(self) -> None:
+        members = [m for m in (self.ale_group_members or "").replace(",", " ").split() if m][:5]
+        if not members:
+            return
+        if self.ale_live and self.ale is not None:
+            self.ale.send_group(members)
+        else:
+            self._ale_demo["state"].update(fsm=3, fsm_name="GROUP_LINKED", linked=True,
+                                           link_peer=members[0], scanning=False)
+            self._ale_demo_log(1, "TX", f"GROUP CALL {' '.join(members)}")
+            self.changed.emit("radio")
+
+    def ale_net_call(self) -> None:
+        netid = (self.ale_net_id or "").strip()
+        if not netid:
+            return
+        if self.ale_live and self.ale is not None:
+            self.ale.send_net(netid)
+        else:
+            self._ale_demo["state"].update(fsm=4, fsm_name="NET_LINKED", linked=True,
+                                           link_peer=netid, scanning=False)
+            self._ale_demo_log(1, "TX", f"NET CALL {netid}")
+            self.changed.emit("radio")
+
+    def ale_terminate(self) -> None:
+        if self.ale_live and self.ale is not None:
+            self.ale.send_term("")
+        else:
+            self._ale_demo["state"].update(fsm=0, fsm_name="AVAILABLE", linked=False,
+                                           link_peer="", forced=False, scanning=True)
+            self._ale_demo_log(2, "SYS", "Link terminated · scan resumed")
+            self.changed.emit("radio")
+            self.changed.emit("toolbar")
+
+    def ale_sound(self) -> None:
+        if self.ale_live and self.ale is not None:
+            self.ale.send_sound(self.ale_sound_mode)
+        else:
+            st = self._ale_demo["state"]
+            self._ale_demo["sound_hist"].insert(0, {"t": _now(), "ch": st.get("cur_channel", -1),
+                                                    "q": 0, "ack": "—"})
+            del self._ale_demo["sound_hist"][8:]
+            self._ale_demo_log(3, "SND", f"Sounding ({SOUND_MODE_NAMES.get(self.ale_sound_mode, '?')})")
+            self.changed.emit("radio")
+            self.changed.emit("radio_tele")
+
+    def set_ale_sound_mode(self, v: int) -> None:
+        self.ale_sound_mode = int(v)
+        self.changed.emit("radio")
+
+    def ale_send_amd(self) -> None:
+        text = (self.ale_amd_text or "").strip()
+        if not text:
+            return
+        dest = (self.ale_amd_dest or "").strip()
+        if self.ale_live and self.ale is not None:
+            self.ale.send_amd(dest, text)
+        else:
+            self._ale_demo_log(1, "TX", f"AMD→{dest or 'link'}: {text}")
+        self.ale_amd_text = ""
+        self.changed.emit("radio")
+
+    def ale_set_tx_power(self, dbm: int) -> None:
+        if self.ale_live and self.ale is not None:
+            self.ale.send_config(tx_power_dbm=int(dbm))
+        else:
+            self._ale_demo["state"].update(tx_power_dbm=int(dbm),
+                                           tx_power=round(10 ** (int(dbm) / 10) / 1000.0, 1))
+            self._ale_demo_log(2, "SYS", f"TX power → {dbm} dBm")
+            self.changed.emit("radio")
+            self.changed.emit("toolbar")
+
+    def ale_set_sideband(self, sb: int) -> None:
+        if self.ale_live and self.ale is not None:
+            self.ale.send_config(sideband=int(sb))
+        else:
+            self._ale_demo["state"].update(sideband=int(sb),
+                                           sideband_name=SIDEBAND_NAMES.get(int(sb), str(sb)))
+            self._ale_demo_log(2, "SYS", f"Sideband → {SIDEBAND_NAMES.get(int(sb), sb)}")
+            self.changed.emit("radio")
+            self.changed.emit("toolbar")
+
+    def ale_set_scan_rate(self, n: int) -> None:
+        if self.ale_live and self.ale is not None:
+            self.ale.send_config(scan_rate=int(n))
+        else:
+            self._ale_demo["state"].update(scan_rate=int(n))
+            self._ale_demo_log(2, "SYS", f"Scan rate → {n} ch/s")
+            self.changed.emit("radio")
+
+    def ale_set_occupancy(self, on: bool) -> None:
+        if self.ale_live and self.ale is not None:
+            self.ale.send_config(occupancy_detect=1 if on else 0)
+        else:
+            self._ale_demo["state"].update(occupancy_detect=bool(on))
+            self._ale_demo_log(2, "SYS", f"Occupancy detect → {'ON' if on else 'OFF'}")
+            self.changed.emit("radio")
+
+    def ale_apply_twa(self) -> None:
+        s = (self.ale_twa_draft or "").strip()
+        if not s:
+            return
+        val = int(s)
+        if self.ale_live and self.ale is not None:
+            self.ale.send_config(twa_s=val)
+        else:
+            self._ale_demo["state"].update(twa_max=val, twa_remain=val)
+            self._ale_demo_log(2, "SYS", f"Twa → {val} s")
+            self.changed.emit("radio")
+        self.ale_twa_draft = ""
+
+    def set_ale_force_service(self, v: str) -> None:
+        self.ale_force_service = v
+        self.changed.emit("radio")
+
+    def ale_park(self) -> None:
+        """FORCE_LINK: park the channel in the Channel field (manual mode)."""
+        ch = self._parse_call_channel()
+        st = self._radio_state()
+        if ch < 0:
+            ch = st.get("cur_channel", 0)
+            if ch < 0:
+                ch = 0
+        if self.ale_live and self.ale is not None:
+            self.ale.send_force_link(ch, True, self.ale_force_service)
+        else:
+            self._ale_demo["state"].update(forced=True, scanning=False, cur_channel=ch,
+                                           active_service=self.ale_force_service)
+            self._ale_demo_log(2, "SYS", f"FORCED on ch{ch} ({self.ale_force_service})")
+            self.changed.emit("radio")
+            self.changed.emit("toolbar")
+
+    def ale_normal(self) -> None:
+        """FORCE_LINK forced=0 — leave manual mode, resume scan/sounding."""
+        st = self._radio_state()
+        ch = st.get("cur_channel", 0)
+        if ch < 0:
+            ch = 0
+        if self.ale_live and self.ale is not None:
+            self.ale.send_force_link(ch, False, self.ale_force_service)
+        else:
+            self._ale_demo["state"].update(forced=False, scanning=True, active_service="")
+            self._ale_demo_log(2, "SYS", "NORMAL · scan resumed")
+            self.changed.emit("radio")
+
+    def ale_chedit_apply(self) -> None:
+        s = (self.ale_chedit_idx or "").strip()
+        if not s:
+            return
+        idx = int(s)
+        freq = (self.ale_chedit_freq or "").strip()
+        name = (self.ale_chedit_name or "").strip()
+        if self.ale_live and self.ale is not None:
+            self.ale.send_chedit(idx, freq, name)
+        else:
+            for c in self._ale_demo["channels"]:
+                if c["idx"] == idx:
+                    if freq:
+                        c["freq"] = freq
+                    if name:
+                        c["name"] = name
+                    break
+            self._ale_demo_log(2, "SYS", f"CHEDIT ch{idx} {freq or ''} {name or ''}".strip())
+            self.changed.emit("radio")
+            self.changed.emit("toolbar")
+
+    def ale_prefill_channel(self, idx: int) -> None:
+        """Channel-row click: seed the Call/Edit forms with this channel."""
+        self.ale_call_channel = str(idx)
+        self.ale_chedit_idx = str(idx)
+        for c in self._radio_channels():
+            if c.get("idx") == idx:
+                self.ale_chedit_freq = c.get("freq", "")
+                self.ale_chedit_name = c.get("name", "")
+                break
+        self.changed.emit("radio")
 
     # -------------------------------------------------------------- mail cmd
     def set_mail_folder(self, f: str) -> None:

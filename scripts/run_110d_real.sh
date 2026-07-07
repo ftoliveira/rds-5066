@@ -15,12 +15,20 @@
 # servidor na porta 3000 do Appendix A). Um único encaminhamento SSH -L basta —
 # o modem nunca inicia conexão de volta.
 #
-# NOTA (Fase 2, em progresso): o console é lançado em modo --live, arrancando um
-# StanagNode real e ABRINDO a ligação TCP ao modem (data path DTE↔DCE) via túnel —
-# o painel "Modem Link" mostra LINKED e a taxa reportada quando o handshake conclui.
-# Os clientes de tráfego (HFCHAT, Mail, ficheiros) estão a ser ligados ao backend
-# incrementalmente; enquanto isso, para um teste de tráfego de chat de ponta a ponta
-# use src/interface/chat_app_110d.py.
+# NOTA (Fase 2): o console é lançado em modo --live, arrancando um StanagNode real
+# e ABRINDO a ligação TCP ao modem (data path DTE↔DCE) via túnel — o painel
+# "Modem Link" mostra LINKED e a taxa reportada quando o handshake conclui.
+#
+# RADIO CONTROL (ALE 2G, UDP :54001): o ecrã "Radio Control" fala o protocolo de
+# controlo remoto do rádio (docs/PROTOCOLO-CONTROLE-REMOTO.md) — freq/potência/
+# scanning/links — por UDP, no MESMO host do modem (a black). Como o SSH -L só
+# encaminha TCP, este UDP é tunelado com `socat` nas duas pontas (ponte UDP↔TCP):
+#
+#   app  --UDP:54001-->  socat(local)  --TCP--> [ -L túnel ] --TCP--> socat(red)  --UDP:54001-->  radio backend (black)
+#
+# Requer `socat` na sua máquina E na red. Alternativas:
+#   --ale-host <ip>   backend do rádio diretamente alcançável (sem ponte/túnel)
+#   --no-ale          não abrir o Radio Control (fica OFFLINE)
 #
 # Uso:
 #   scripts/run_110d_real.sh <serial_number> [opções]
@@ -44,6 +52,18 @@ PYTHON="${PYTHON:-python3}"
 NO_APP=0
 SKIP_PREFLIGHT=0
 
+# ---- Radio Control (ALE 2G, UDP) ----
+ALE_PORT="54001"             # porta UDP do backend de controlo do rádio (na black)
+ALE_BLACK_IP=""              # IP do backend do rádio visto pela red (default = BLACK_IP)
+LOCAL_ALE_PORT=""            # porta UDP local onde a app fala com o socat (default = ALE_PORT)
+ALE_BRIDGE_PORT=""           # porta TCP da ponte socat sobre o túnel (default = LOCAL_ALE_PORT+1)
+ALE_HOST_OVERRIDE=""         # se definido: liga direto a este host (sem ponte/túnel)
+NO_ALE=0                     # 1 = não abrir o Radio Control
+
+# ---- runtime state (cleanup) ----
+LOCAL_SOCAT_PID=""
+ALE_BRIDGE_ACTIVE=0
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP="$REPO_ROOT/src/interface/subnet_console/__main__.py"
 
@@ -51,13 +71,14 @@ usage() {
     cat <<EOF
 Uso: $(basename "$0") <serial_number> [opções]
 
-Sobe um túnel SSH pela red e lança o Subnet Console (PyQt6) na sua máquina,
-com o painel "Modem Link" apontando para o modem 110D real na black via túnel.
+Sobe um túnel SSH pela red e lança o Subnet Console (PyQt6) na sua máquina, com o
+painel "Modem Link" apontando para o modem 110D real na black via túnel e o ecrã
+"Radio Control" (ALE 2G, UDP :54001) tunelado via socat.
 
 Positional:
   serial_number         SN do equipamento (1-254). Red IP = ${RED_PREFIX}.<SN>
 
-Opções:
+Opções (modem / túnel):
   -n, --node A|B        Identidade do nó STANAG (default: ${NODE})
   -a, --accent COR      Cor do tema: blue|green|purple|orange|gray (default: app)
   -u, --user USER       Usuário SSH na red (default: \$USER = ${SSH_USER})
@@ -65,18 +86,33 @@ Opções:
   -p, --modem-port N    Porta TCP do modem / Appendix A (default: ${MODEM_PORT})
   -l, --local-port N    Porta local do túnel (default: = porta do modem)
       --red-prefix P    Prefixo /24 da red (default: ${RED_PREFIX})
-      --no-app          Só sobe o túnel (não lança a GUI); Enter encerra
+      --no-app          Só sobe o(s) túnel(is) (não lança a GUI); Enter encerra
       --skip-preflight  Não testa a acessibilidade do modem pela red
+
+Opções (Radio Control / ALE 2G, UDP):
+      --ale-port N      Porta UDP do backend do rádio (default: ${ALE_PORT})
+      --ale-black-ip IP IP do backend do rádio visto pela red (default: = --black-ip)
+      --local-ale-port N  Porta UDP local da ponte (default: = --ale-port)
+      --ale-bridge-port N Porta TCP da ponte socat (default: = local-ale-port + 1)
+      --ale-host IP     Liga direto a este host (backend alcançável; sem ponte/túnel)
+      --no-ale          Não abrir o Radio Control (fica OFFLINE)
+
   -h, --help            Esta ajuda
 
 Exemplos:
-  # red em 192.168.108.12, nó A, modem 192.168.0.2:3000 via 127.0.0.1:3000
+  # red em 192.168.108.12, nó A; modem e rádio em 192.168.0.2 (via túnel/socat)
   $(basename "$0") 12
 
   # usuário SSH 'rds' na red, nó B
   $(basename "$0") 12 -u rds -n B
 
-  # só o túnel, para usar com uma app já aberta
+  # backend do rádio diretamente alcançável (sem socat), noutro IP
+  $(basename "$0") 12 --ale-host 192.168.0.50
+
+  # sem Radio Control (só STANAG 5066)
+  $(basename "$0") 12 --no-ale
+
+  # só o(s) túnel(is), para usar com uma app já aberta
   $(basename "$0") 12 --no-app
 EOF
 }
@@ -87,17 +123,23 @@ EOF
 SN=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -n|--node)        NODE="${2:-}"; shift 2 ;;
-        -a|--accent)      ACCENT="${2:-}"; shift 2 ;;
-        -u|--user)        SSH_USER="${2:-}"; shift 2 ;;
-        -b|--black-ip)    BLACK_IP="${2:-}"; shift 2 ;;
-        -p|--modem-port)  MODEM_PORT="${2:-}"; shift 2 ;;
-        -l|--local-port)  LOCAL_PORT="${2:-}"; shift 2 ;;
-        --red-prefix)     RED_PREFIX="${2:-}"; shift 2 ;;
-        --no-app)         NO_APP=1; shift ;;
-        --skip-preflight) SKIP_PREFLIGHT=1; shift ;;
-        -h|--help)        usage; exit 0 ;;
-        -*)               echo "ERRO: opção desconhecida: $1" >&2; usage >&2; exit 2 ;;
+        -n|--node)         NODE="${2:-}"; shift 2 ;;
+        -a|--accent)       ACCENT="${2:-}"; shift 2 ;;
+        -u|--user)         SSH_USER="${2:-}"; shift 2 ;;
+        -b|--black-ip)     BLACK_IP="${2:-}"; shift 2 ;;
+        -p|--modem-port)   MODEM_PORT="${2:-}"; shift 2 ;;
+        -l|--local-port)   LOCAL_PORT="${2:-}"; shift 2 ;;
+        --red-prefix)      RED_PREFIX="${2:-}"; shift 2 ;;
+        --no-app)          NO_APP=1; shift ;;
+        --skip-preflight)  SKIP_PREFLIGHT=1; shift ;;
+        --ale-port)        ALE_PORT="${2:-}"; shift 2 ;;
+        --ale-black-ip)    ALE_BLACK_IP="${2:-}"; shift 2 ;;
+        --local-ale-port)  LOCAL_ALE_PORT="${2:-}"; shift 2 ;;
+        --ale-bridge-port) ALE_BRIDGE_PORT="${2:-}"; shift 2 ;;
+        --ale-host)        ALE_HOST_OVERRIDE="${2:-}"; shift 2 ;;
+        --no-ale)          NO_ALE=1; shift ;;
+        -h|--help)         usage; exit 0 ;;
+        -*)                echo "ERRO: opção desconhecida: $1" >&2; usage >&2; exit 2 ;;
         *)
             if [[ -z "$SN" ]]; then SN="$1"; shift
             else echo "ERRO: argumento posicional extra: $1" >&2; exit 2; fi
@@ -135,14 +177,41 @@ if [[ ! -f "$APP" ]]; then
 fi
 [[ -z "$LOCAL_PORT" ]] && LOCAL_PORT="$MODEM_PORT"
 
+# ---- derivar defaults do ALE ----
+[[ -z "$ALE_BLACK_IP" ]] && ALE_BLACK_IP="$BLACK_IP"
+[[ -z "$LOCAL_ALE_PORT" ]] && LOCAL_ALE_PORT="$ALE_PORT"
+[[ -z "$ALE_BRIDGE_PORT" ]] && ALE_BRIDGE_PORT=$(( LOCAL_ALE_PORT + 1 ))
+for _p in "$ALE_PORT" "$LOCAL_ALE_PORT" "$ALE_BRIDGE_PORT"; do
+    if ! [[ "$_p" =~ ^[0-9]+$ ]] || (( _p < 1 || _p > 65535 )); then
+        echo "ERRO: porta ALE inválida ('$_p'). Deve ser inteiro 1-65535." >&2
+        exit 2
+    fi
+done
+
 RED_IP="${RED_PREFIX}.${SN}"
 SSH_TARGET="${SSH_USER}@${RED_IP}"
 CTRL="$(mktemp -u "${TMPDIR:-/tmp}/ssh-110d-${SN}-XXXXXX")"
 
+# Plano do ALE (para o resumo); a viabilidade real da ponte só se sabe com o master no ar.
+if (( NO_ALE )); then
+    ALE_SUMMARY="desativado (--no-ale)"
+elif [[ -n "$ALE_HOST_OVERRIDE" ]]; then
+    ALE_SUMMARY="${ALE_HOST_OVERRIDE}:${ALE_PORT}/udp (direto, sem túnel)"
+else
+    ALE_SUMMARY="ponte socat UDP -> ${ALE_BLACK_IP}:${ALE_PORT}/udp (via red)"
+fi
+
 # ---------------------------------------------------------------------------
-# Teardown do túnel ao sair (fecha o control-master)
+# Teardown ao sair: mata os socats da ponte ALE e fecha o control-master.
 # ---------------------------------------------------------------------------
 cleanup() {
+    if [[ -n "$LOCAL_SOCAT_PID" ]]; then
+        kill "$LOCAL_SOCAT_PID" 2>/dev/null || true
+    fi
+    if [[ "$ALE_BRIDGE_ACTIVE" -eq 1 && -S "$CTRL" ]]; then
+        ssh -S "$CTRL" "$SSH_TARGET" \
+            "pkill -f 'socat.*TCP4-LISTEN:${ALE_BRIDGE_PORT}'" 2>/dev/null || true
+    fi
     if [[ -S "$CTRL" ]]; then
         ssh -S "$CTRL" -O exit "$SSH_TARGET" 2>/dev/null || true
     fi
@@ -159,6 +228,7 @@ cat <<EOF
  Modem (black): ${BLACK_IP}:${MODEM_PORT}   (via red)
  Túnel local:   127.0.0.1:${LOCAL_PORT}  ->  ${BLACK_IP}:${MODEM_PORT}
  Nó STANAG:     ${NODE}
+ Radio Control: ${ALE_SUMMARY}
  App:           Subnet Console (PyQt6) — modo --live (liga ao modem real)
 ────────────────────────────────────────────────────────────
 EOF
@@ -198,23 +268,70 @@ if [[ "$SKIP_PREFLIGHT" -eq 0 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Lança a app (ou mantém só o túnel)
+# Radio Control (ALE 2G, UDP): monta a ponte UDP-sobre-SSH com socat, ou liga
+# direto (--ale-host), ou desativa (--no-ale / socat ausente).
 # ---------------------------------------------------------------------------
-# Argumentos da app. --live arranca um StanagNode real ligado ao modem via túnel.
-APP_ARGS=(--live --node "$NODE" --modem-host 127.0.0.1 --modem-port "$LOCAL_PORT")
+ALE_APP_ARGS=()
+if (( NO_ALE )); then
+    echo "==> Radio Control (ALE) desativado por --no-ale."
+    ALE_APP_ARGS=(--no-ale)
+elif [[ -n "$ALE_HOST_OVERRIDE" ]]; then
+    echo "==> Radio Control (ALE) direto: ${ALE_HOST_OVERRIDE}:${ALE_PORT}/udp (sem túnel)."
+    ALE_APP_ARGS=(--ale-host "$ALE_HOST_OVERRIDE" --ale-port "$ALE_PORT")
+elif ! command -v socat >/dev/null 2>&1; then
+    echo "    AVISO: 'socat' não encontrado localmente — não é possível tunelar o UDP :${ALE_PORT} do ALE." >&2
+    echo "           Radio Control ficará OFFLINE. Instale socat, use --ale-host <ip-direto>, ou --no-ale." >&2
+    ALE_APP_ARGS=(--no-ale)
+elif ! ssh -S "$CTRL" "$SSH_TARGET" 'command -v socat >/dev/null 2>&1'; then
+    echo "    AVISO: 'socat' não encontrado na red (${RED_IP}) — não é possível tunelar o UDP do ALE." >&2
+    echo "           Radio Control ficará OFFLINE. Instale socat na red, use --ale-host, ou --no-ale." >&2
+    ALE_APP_ARGS=(--no-ale)
+else
+    echo "==> Montando ponte UDP-sobre-SSH do ALE (socat):"
+    echo "    127.0.0.1:${LOCAL_ALE_PORT}/udp  ->  [tcp ${ALE_BRIDGE_PORT} via red]  ->  ${ALE_BLACK_IP}:${ALE_PORT}/udp"
+    # 1) forward do porto TCP da ponte sobre o master já ativo
+    if ! ssh -O forward -S "$CTRL" \
+            -L "127.0.0.1:${ALE_BRIDGE_PORT}:127.0.0.1:${ALE_BRIDGE_PORT}" "$SSH_TARGET" 2>/dev/null; then
+        echo "    AVISO: não foi possível abrir o forward TCP :${ALE_BRIDGE_PORT} da ponte ALE." >&2
+        echo "           Radio Control ficará OFFLINE (tente --ale-bridge-port com outra porta livre)." >&2
+        ALE_APP_ARGS=(--no-ale)
+    else
+        # 2) lado red: TCP-LISTEN -> UDP para o backend do rádio na black
+        ssh -S "$CTRL" "$SSH_TARGET" \
+            "nohup socat -T30 TCP4-LISTEN:${ALE_BRIDGE_PORT},reuseaddr,fork UDP4:${ALE_BLACK_IP}:${ALE_PORT} >/dev/null 2>&1 &" \
+            2>/dev/null || true
+        ALE_BRIDGE_ACTIVE=1
+        # 3) lado local: UDP-LISTEN (alvo da app) -> TCP para dentro do túnel
+        socat -T30 "UDP4-LISTEN:${LOCAL_ALE_PORT},reuseaddr,fork" \
+              "TCP4:127.0.0.1:${ALE_BRIDGE_PORT}" >/dev/null 2>&1 &
+        LOCAL_SOCAT_PID=$!
+        echo "    ponte ALE ativa (socat local pid ${LOCAL_SOCAT_PID}; red em ${ALE_BRIDGE_PORT}/tcp)"
+        ALE_APP_ARGS=(--ale-host 127.0.0.1 --ale-port "$LOCAL_ALE_PORT")
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Lança a app (ou mantém só o(s) túnel(is))
+# ---------------------------------------------------------------------------
+# --live arranca um StanagNode real ligado ao modem via túnel; as flags do ALE
+# apontam o Radio Control para a ponte socat (ou o host direto / --no-ale).
+APP_ARGS=(--live --node "$NODE" --modem-host 127.0.0.1 --modem-port "$LOCAL_PORT" "${ALE_APP_ARGS[@]}")
 [[ -n "$ACCENT" ]] && APP_ARGS+=(--accent "$ACCENT")
 
 if [[ "$NO_APP" -eq 1 ]]; then
     echo
-    echo "Túnel no ar. No painel 'Modem Link' use  Modem host=127.0.0.1  Porta=${LOCAL_PORT}."
+    echo "Túnel(is) no ar. No painel 'Modem Link' use  Modem host=127.0.0.1  Porta=${LOCAL_PORT}."
+    if [[ "$ALE_BRIDGE_ACTIVE" -eq 1 ]]; then
+        echo "Radio Control: aponte para  --ale-host 127.0.0.1 --ale-port ${LOCAL_ALE_PORT}  (ponte socat ativa)."
+    fi
     echo "Ex.: $PYTHON \"$APP\" ${APP_ARGS[*]}"
     echo
-    read -r -p "Pressione Enter para encerrar o túnel..." _
+    read -r -p "Pressione Enter para encerrar o(s) túnel(is)..." _
     exit 0
 fi
 
 echo "==> Lançando Subnet Console (nó ${NODE})..."
-echo "    (feche a janela da app para encerrar o túnel)"
+echo "    (feche a janela da app para encerrar o(s) túnel(is))"
 echo
 set +e
 "$PYTHON" "$APP" "${APP_ARGS[@]}"
@@ -222,5 +339,5 @@ APP_RC=$?
 set -e
 
 echo
-echo "==> App encerrada (rc=${APP_RC}). Fechando túnel."
+echo "==> App encerrada (rc=${APP_RC}). Fechando túnel(is)."
 exit "$APP_RC"
